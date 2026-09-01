@@ -84,6 +84,7 @@ function pathIsAllowlisted(path) {
     'README.md',
     'SECURITY.md',
     'controller-identity.json',
+    'package-lock.json',
     'package.json',
   ]);
   if (rootFiles.has(path)) return true;

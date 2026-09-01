@@ -37,11 +37,22 @@ true:
 10. An interrupted or ambiguous remote operation fails closed and requires
    reconciliation; it is never retried blindly.
 
-The `canary` operation crosses the same approval, identity, replay and private
-transport boundaries as production, then records a hash-only
-`canary_verified` receipt without invoking any provider mutation. The
-`production-release` operation cannot mutate a provider until the fixed
-controller-owned adapter is added after that remote proof.
+Every operation crosses the same approval, identity, replay and private
+transport boundaries. Production follows the exact receipt chain
+`provider-canary` -> `production-dns-stage` -> `production-bootstrap` ->
+`production-release` -> `production-cutover`. DNS staging may create a pending
+Cloudflare zone, set the exact mirrored records and pin Full (strict), Always
+Use HTTPS and TLS 1.2 minimum, but cannot mutate registrar delegation or route
+production traffic. Bootstrap refuses to provision D1 or Access until active
+delegation converges through two independent resolvers, DS is absent, the
+exact DNS/settings/Resend identities match the encrypted stage receipt and the
+legacy WordPress HTTPS fallback is externally proven.
+
+The pre-cutover route baseline is never empty: it contains only the Access-
+protected internal API and dashboard routes. Candidate verification adds the
+public lead and Resend webhook routes temporarily, then restores the exact
+baseline. Production cutover accepts only that baseline and uses it as the
+rollback target.
 
 Branch protection, required checks and a protected Environment are controls
 used to enforce the invariant. They are not substitutes for exact-SHA,

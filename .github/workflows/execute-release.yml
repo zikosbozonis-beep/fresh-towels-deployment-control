@@ -55,7 +55,7 @@ jobs:
   protected-execution:
     needs: intake
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     environment:
       name: ${{ needs.intake.outputs.operation == 'canary' && 'canary' || 'production' }}
     steps:
@@ -98,6 +98,7 @@ jobs:
             'const fs=require("fs");const d=JSON.parse(process.env.RESPONSE);if(typeof d.value!=="string"||d.value.length<100)process.exit(1);fs.writeFileSync(process.env.RUNNER_TEMP+"/executor-oidc.jwt",d.value,{mode:0o400,flag:"wx"})'
           unset response
       - name: Atomically claim this exact execution
+        id: execution-claim
         env:
           RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
         run: >-
@@ -106,6 +107,7 @@ jobs:
           "$RUNNER_TEMP/executor-oidc.jwt"
           execute-claim
       - name: Fetch and decrypt exact approved private transport
+        id: protected-transport
         env:
           EXPECTED_CONTROLLER_REPOSITORY_ID: ${{ vars.EXPECTED_CONTROLLER_REPOSITORY_ID }}
           EXPECTED_SOURCE_REPOSITORY_ID: ${{ vars.EXPECTED_SOURCE_REPOSITORY_ID }}
@@ -118,16 +120,169 @@ jobs:
           RELEASE_DECRYPTION_PASSPHRASE: ${{ secrets.RELEASE_DECRYPTION_PASSPHRASE }}
           RELEASE_DECRYPTION_PASSPHRASE_SHA256: ${{ secrets.RELEASE_DECRYPTION_PASSPHRASE_SHA256 }}
           RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
+          PRODUCTION_ACCESS_ADMIN_EMAIL: ${{ needs.intake.outputs.operation == 'production-bootstrap' && secrets.PRODUCTION_ACCESS_ADMIN_EMAIL || '' }}
           VERIFIED_PAYLOAD_OUTPUT_DIRECTORY: ${{ runner.temp }}/verified-release
         run: node scripts/protected-transport.mjs
+      - name: Acquire prerequisite-verification identity
+        if: needs.intake.outputs.operation == 'production-dns-stage' || needs.intake.outputs.operation == 'production-bootstrap' || needs.intake.outputs.operation == 'production-release' || needs.intake.outputs.operation == 'production-cutover'
+        shell: bash
+        env:
+          OIDC_AUDIENCE: deployment-control-executor-v1
+        run: |
+          set -euo pipefail
+          response="$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
+          RESPONSE="$response" node -e \
+            'const fs=require("fs");const d=JSON.parse(process.env.RESPONSE);if(typeof d.value!=="string"||d.value.length<100)process.exit(1);fs.writeFileSync(process.env.RUNNER_TEMP+"/executor-prerequisite-oidc.jwt",d.value,{mode:0o400,flag:"wx"})'
+          unset response
+      - name: Verify exact operation prerequisite
+        if: needs.intake.outputs.operation == 'production-dns-stage' || needs.intake.outputs.operation == 'production-bootstrap' || needs.intake.outputs.operation == 'production-release' || needs.intake.outputs.operation == 'production-cutover'
+        env:
+          PREREQUISITE_RECEIPT_SHA256: ${{ steps.protected-transport.outputs.prerequisite_receipt_sha256 }}
+          PREREQUISITE_REQUEST_ID: ${{ steps.protected-transport.outputs.prerequisite_request_id }}
+          PREREQUISITE_RUN_ID: ${{ steps.protected-transport.outputs.prerequisite_run_id }}
+          RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
+        run: >-
+          node scripts/dispatch-controller.mjs
+          controller-identity.json
+          "$RUNNER_TEMP/executor-prerequisite-oidc.jwt"
+          verify-prerequisite
       - name: Prepare hash-only canary receipt
         if: needs.intake.outputs.operation == 'canary'
         id: canary-receipt
         env:
           RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
         run: node scripts/create-canary-receipt.mjs
-      - name: Acquire canary-finish identity
-        if: needs.intake.outputs.operation == 'canary'
+      - name: Execute bounded non-production provider Canary
+        if: needs.intake.outputs.operation == 'provider-canary'
+        id: provider-canary
+        env:
+          CLOUDFLARE_PROVIDER_CANARY_TOKEN: ${{ secrets.CLOUDFLARE_PROVIDER_CANARY_TOKEN }}
+          EXPECTED_CONTROLLER_REPOSITORY_ID: ${{ vars.EXPECTED_CONTROLLER_REPOSITORY_ID }}
+          EXPECTED_SOURCE_REPOSITORY_ID: ${{ vars.EXPECTED_SOURCE_REPOSITORY_ID }}
+          RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
+          RESEND_PROVIDER_CANARY_TOKEN: ${{ secrets.RESEND_PROVIDER_CANARY_TOKEN }}
+        run: >-
+          node scripts/provider-canary.mjs
+          --capsule "$RUNNER_TEMP/verified-release/release-capsule.bin"
+          --output "$RUNNER_TEMP/provider-canary-receipt.json"
+      - name: Retain immutable hash-only provider Canary evidence
+        if: needs.intake.outputs.operation == 'provider-canary'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: provider-canary-receipt-${{ needs.intake.outputs.requestId }}
+          path: ${{ runner.temp }}/provider-canary-receipt.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Stage exact production DNS without switching traffic
+        if: needs.intake.outputs.operation == 'production-dns-stage'
+        id: production-dns-stage
+        env:
+          CLOUDFLARE_PRODUCTION_TOKEN: ${{ secrets.CLOUDFLARE_PRODUCTION_TOKEN }}
+          EXPECTED_BROKER_REQUEST_ID: ${{ needs.intake.outputs.requestId }}
+          EXPECTED_CAPSULE_REQUEST_SHA256: ${{ steps.protected-transport.outputs.capsule_request_sha256 }}
+          PROTECTED_EXECUTION_RUN_ID: ${{ github.run_id }}
+          RELEASE_DECRYPTION_PRIVATE_KEY: ${{ secrets.RELEASE_DECRYPTION_PRIVATE_KEY }}
+          RELEASE_DECRYPTION_PRIVATE_KEY_SHA256: ${{ secrets.RELEASE_DECRYPTION_PRIVATE_KEY_SHA256 }}
+          RELEASE_DECRYPTION_PASSPHRASE: ${{ secrets.RELEASE_DECRYPTION_PASSPHRASE }}
+          RELEASE_DECRYPTION_PASSPHRASE_SHA256: ${{ secrets.RELEASE_DECRYPTION_PASSPHRASE_SHA256 }}
+          RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
+          RESEND_PRODUCTION_ADMIN_TOKEN: ${{ secrets.RESEND_PRODUCTION_ADMIN_TOKEN }}
+        run: >-
+          node scripts/run-production-dns-stage.mjs
+          --capsule "$RUNNER_TEMP/verified-release/release-capsule.bin"
+          --output "$RUNNER_TEMP/production-dns-stage-evidence.json"
+      - name: Retain immutable hash-only production DNS-stage evidence
+        if: needs.intake.outputs.operation == 'production-dns-stage'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: production-dns-stage-evidence-${{ needs.intake.outputs.requestId }}
+          path: ${{ runner.temp }}/production-dns-stage-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Execute exact production provider Bootstrap
+        if: needs.intake.outputs.operation == 'production-bootstrap'
+        id: production-bootstrap
+        env:
+          CLOUDFLARE_PRODUCTION_TOKEN: ${{ secrets.CLOUDFLARE_PRODUCTION_TOKEN }}
+          EXPECTED_BROKER_REQUEST_ID: ${{ needs.intake.outputs.requestId }}
+          EXPECTED_CAPSULE_REQUEST_SHA256: ${{ steps.protected-transport.outputs.capsule_request_sha256 }}
+          PRODUCTION_ACCESS_ADMIN_EMAIL: ${{ secrets.PRODUCTION_ACCESS_ADMIN_EMAIL }}
+          PROTECTED_EXECUTION_RUN_ID: ${{ github.run_id }}
+          RELEASE_DECRYPTION_PRIVATE_KEY: ${{ secrets.RELEASE_DECRYPTION_PRIVATE_KEY }}
+          RELEASE_DECRYPTION_PRIVATE_KEY_SHA256: ${{ secrets.RELEASE_DECRYPTION_PRIVATE_KEY_SHA256 }}
+          RELEASE_DECRYPTION_PASSPHRASE: ${{ secrets.RELEASE_DECRYPTION_PASSPHRASE }}
+          RELEASE_DECRYPTION_PASSPHRASE_SHA256: ${{ secrets.RELEASE_DECRYPTION_PASSPHRASE_SHA256 }}
+          RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
+          RESEND_PRODUCTION_ADMIN_TOKEN: ${{ secrets.RESEND_PRODUCTION_ADMIN_TOKEN }}
+        run: >-
+          node scripts/run-production-provider-bootstrap.mjs
+          --capsule "$RUNNER_TEMP/verified-release/release-capsule.bin"
+          --output "$RUNNER_TEMP/production-bootstrap-evidence.json"
+      - name: Retain immutable hash-only production Bootstrap evidence
+        if: needs.intake.outputs.operation == 'production-bootstrap'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: production-bootstrap-evidence-${{ needs.intake.outputs.requestId }}
+          path: ${{ runner.temp }}/production-bootstrap-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Install exact production executor dependency graph
+        if: needs.intake.outputs.operation == 'production-release'
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Execute exact production release with protected pre-cutover routes
+        if: needs.intake.outputs.operation == 'production-release'
+        id: production-release
+        env:
+          CLOUDFLARE_PRODUCTION_TOKEN: ${{ secrets.CLOUDFLARE_PRODUCTION_TOKEN }}
+          RELEASE_DECRYPTION_PRIVATE_KEY: ${{ secrets.RELEASE_DECRYPTION_PRIVATE_KEY }}
+          RELEASE_DECRYPTION_PRIVATE_KEY_SHA256: ${{ secrets.RELEASE_DECRYPTION_PRIVATE_KEY_SHA256 }}
+          RELEASE_DECRYPTION_PASSPHRASE: ${{ secrets.RELEASE_DECRYPTION_PASSPHRASE }}
+          RELEASE_DECRYPTION_PASSPHRASE_SHA256: ${{ secrets.RELEASE_DECRYPTION_PASSPHRASE_SHA256 }}
+          RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
+          RESEND_PRODUCTION_ADMIN_TOKEN: ${{ secrets.RESEND_PRODUCTION_ADMIN_TOKEN }}
+        run: >-
+          node scripts/run-production-release.mjs
+          --capsule "$RUNNER_TEMP/verified-release/release-capsule.bin"
+          --output "$RUNNER_TEMP/production-release-evidence.json"
+      - name: Retain immutable hash-only production release evidence
+        if: needs.intake.outputs.operation == 'production-release'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: production-release-evidence-${{ needs.intake.outputs.requestId }}
+          path: ${{ runner.temp }}/production-release-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Execute exact production cutover from protected pre-cutover fallback
+        if: needs.intake.outputs.operation == 'production-cutover'
+        id: production-cutover
+        env:
+          CLOUDFLARE_PRODUCTION_TOKEN: ${{ secrets.CLOUDFLARE_PRODUCTION_TOKEN }}
+          EXPECTED_BROKER_REQUEST_ID: ${{ needs.intake.outputs.requestId }}
+          EXPECTED_CAPSULE_REQUEST_SHA256: ${{ steps.protected-transport.outputs.capsule_request_sha256 }}
+          PRODUCTION_ACCESS_ADMIN_EMAIL: ${{ secrets.PRODUCTION_ACCESS_ADMIN_EMAIL }}
+          PROTECTED_EXECUTION_RUN_ID: ${{ github.run_id }}
+          RELEASE_DECRYPTION_PRIVATE_KEY: ${{ secrets.RELEASE_DECRYPTION_PRIVATE_KEY }}
+          RELEASE_DECRYPTION_PRIVATE_KEY_SHA256: ${{ secrets.RELEASE_DECRYPTION_PRIVATE_KEY_SHA256 }}
+          RELEASE_DECRYPTION_PASSPHRASE: ${{ secrets.RELEASE_DECRYPTION_PASSPHRASE }}
+          RELEASE_DECRYPTION_PASSPHRASE_SHA256: ${{ secrets.RELEASE_DECRYPTION_PASSPHRASE_SHA256 }}
+          RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
+          RESEND_PRODUCTION_ADMIN_TOKEN: ${{ secrets.RESEND_PRODUCTION_ADMIN_TOKEN }}
+        run: >-
+          node scripts/run-production-cutover.mjs
+          --capsule "$RUNNER_TEMP/verified-release/release-capsule.bin"
+          --output "$RUNNER_TEMP/production-cutover-evidence.json"
+      - name: Retain immutable hash-only production cutover evidence
+        if: needs.intake.outputs.operation == 'production-cutover'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: production-cutover-evidence-${{ needs.intake.outputs.requestId }}
+          path: ${{ runner.temp }}/production-cutover-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Acquire execution-finish identity
+        if: needs.intake.outputs.operation == 'canary' || needs.intake.outputs.operation == 'provider-canary' || needs.intake.outputs.operation == 'production-dns-stage' || needs.intake.outputs.operation == 'production-bootstrap' || needs.intake.outputs.operation == 'production-release' || needs.intake.outputs.operation == 'production-cutover'
         shell: bash
         env:
           OIDC_AUDIENCE: deployment-control-executor-v1
@@ -150,12 +305,84 @@ jobs:
           controller-identity.json
           "$RUNNER_TEMP/executor-finish-oidc.jwt"
           execute-finish
-      - name: Fail closed until remote canary and executor adapter are proven
+      - name: Record successful provider Canary
+        if: needs.intake.outputs.operation == 'provider-canary'
+        env:
+          EXECUTION_OUTCOME: executed
+          PROVIDER_RECEIPT_SHA256: ${{ steps.provider-canary.outputs.receipt_sha256 }}
+          RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
+        run: >-
+          node scripts/dispatch-controller.mjs
+          controller-identity.json
+          "$RUNNER_TEMP/executor-finish-oidc.jwt"
+          execute-finish
+      - name: Record successful production Bootstrap
+        if: needs.intake.outputs.operation == 'production-bootstrap'
+        env:
+          EXECUTION_OUTCOME: executed
+          PROVIDER_RECEIPT_SHA256: ${{ steps.production-bootstrap.outputs.receipt_sha256 }}
+          RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
+        run: >-
+          node scripts/dispatch-controller.mjs
+          controller-identity.json
+          "$RUNNER_TEMP/executor-finish-oidc.jwt"
+          execute-finish
+      - name: Record successful production DNS stage
+        if: needs.intake.outputs.operation == 'production-dns-stage'
+        env:
+          EXECUTION_OUTCOME: executed
+          PROVIDER_RECEIPT_SHA256: ${{ steps.production-dns-stage.outputs.receipt_sha256 }}
+          RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
+        run: >-
+          node scripts/dispatch-controller.mjs
+          controller-identity.json
+          "$RUNNER_TEMP/executor-finish-oidc.jwt"
+          execute-finish
+      - name: Record successful production release
         if: needs.intake.outputs.operation == 'production-release'
-        run: |
-          echo "::error::PROTECTED_EXECUTOR_CANARY_NOT_YET_PROVEN"
-          exit 78
+        env:
+          EXECUTION_OUTCOME: executed
+          PROVIDER_RECEIPT_SHA256: ${{ steps.production-release.outputs.receipt_sha256 }}
+          RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
+        run: >-
+          node scripts/dispatch-controller.mjs
+          controller-identity.json
+          "$RUNNER_TEMP/executor-finish-oidc.jwt"
+          execute-finish
+      - name: Record successful production cutover
+        if: needs.intake.outputs.operation == 'production-cutover'
+        env:
+          EXECUTION_OUTCOME: executed
+          PROVIDER_RECEIPT_SHA256: ${{ steps.production-cutover.outputs.receipt_sha256 }}
+          RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
+        run: >-
+          node scripts/dispatch-controller.mjs
+          controller-identity.json
+          "$RUNNER_TEMP/executor-finish-oidc.jwt"
+          execute-finish
       - name: Remove protected executor material
         if: always()
         shell: bash
-        run: rm -rf "$RUNNER_TEMP/executor-oidc.jwt" "$RUNNER_TEMP/executor-finish-oidc.jwt" "$RUNNER_TEMP/verified-release"
+        run: rm -rf "$RUNNER_TEMP/executor-oidc.jwt" "$RUNNER_TEMP/executor-prerequisite-oidc.jwt" "$RUNNER_TEMP/executor-finish-oidc.jwt" "$RUNNER_TEMP/provider-canary-receipt.json" "$RUNNER_TEMP/production-dns-stage-evidence.json" "$RUNNER_TEMP/production-bootstrap-evidence.json" "$RUNNER_TEMP/production-release-evidence.json" "$RUNNER_TEMP/production-cutover-evidence.json" "$RUNNER_TEMP/verified-release"
+      - name: Fail-finalize a claimed execution as ambiguous
+        if: ${{ always() && steps.execution-claim.outcome == 'success' && !success() }}
+        shell: bash
+        env:
+          OIDC_AUDIENCE: deployment-control-executor-v1
+          RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
+        run: |
+          set -euo pipefail
+          failure_oidc="$RUNNER_TEMP/executor-failure-oidc.jwt"
+          trap 'rm -f "$failure_oidc"' EXIT
+          response="$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
+          RESPONSE="$response" FAILURE_OIDC="$failure_oidc" node -e \
+            'const fs=require("fs");const d=JSON.parse(process.env.RESPONSE);if(typeof d.value!=="string"||d.value.length<100)process.exit(1);fs.writeFileSync(process.env.FAILURE_OIDC,d.value,{mode:0o400,flag:"wx"})'
+          unset response
+          PROVIDER_RECEIPT_SHA256="$(node scripts/create-ambiguous-receipt.mjs)"
+          export EXECUTION_OUTCOME=execution_ambiguous PROVIDER_RECEIPT_SHA256
+          node scripts/dispatch-controller.mjs \
+            controller-identity.json \
+            "$failure_oidc" \
+            execute-finish

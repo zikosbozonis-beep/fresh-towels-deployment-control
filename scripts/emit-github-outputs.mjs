@@ -14,7 +14,7 @@ const safePatterns = {
   controllerCommitSha: /^[a-f0-9]{40}$/,
   evidenceManifestSha256: /^[a-f0-9]{64}$/,
   evidenceOidcTokenSha256: /^[a-f0-9]{64}$/,
-  operation: /^(canary|production-release)$/,
+  operation: /^(canary|provider-canary|production-dns-stage|production-bootstrap|production-release|production-cutover)$/,
   requestDigest: /^[a-f0-9]{64}$/,
   requestId: /^[a-f0-9-]{36}$/,
   sourceCommitSha: /^[a-f0-9]{40}$/,

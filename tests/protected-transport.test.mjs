@@ -8,6 +8,7 @@ import {
   validateTransportBindings,
   validateManifest,
   validateOperationPayload,
+  protectedOperationOutputs,
   validateTransportTree,
 } from "../scripts/protected-transport.mjs";
 
@@ -316,14 +317,229 @@ function productionCapsule() {
       buildArtifactSha256: "a".repeat(64),
       databaseSchemaSha256: "b".repeat(64),
       releaseApprovalManifestSha256: "c".repeat(64),
-      configurationSha256: "d".repeat(64),
+      configurationTemplateSha256: "d".repeat(64),
       uploadArtifactSha256: "e".repeat(64),
       capsuleTreeSha256: "f".repeat(64),
+      productionInfrastructureReceiptSha256: "7".repeat(64),
     },
-    schemaVersion: 1,
+    schemaVersion: 2,
     capsuleType: "fresh-towels-private-release-capsule",
     validUntil: "2026-09-01T11:59:00.000Z",
   };
+}
+
+function productionBootstrapCapsule(adminIdentity = "owner-admin@example.net") {
+  const application = {
+    repository: "zikosbozonis-beep/fresh-towels-website",
+    repositoryId: "1350923567",
+    ref: "refs/heads/main",
+    commitSha: "1".repeat(40),
+    workflowRef:
+      "zikosbozonis-beep/fresh-towels-website/.github/workflows/release-handoff.yml@refs/heads/main",
+    workflowSha: "1".repeat(40),
+    runId: "3003",
+    runAttempt: 1,
+  };
+  const controller = {
+    repository: "zikosbozonis-beep/fresh-towels-deployment-control",
+    commitSha: "2".repeat(40),
+    workflowRef: `zikosbozonis-beep/fresh-towels-deployment-control/.github/workflows/package-release.yml@${"2".repeat(40)}`,
+  };
+  const providerCanary = {
+    requestId: "77777777-7777-4777-8777-777777777777",
+    receiptSha256: "8".repeat(64),
+    runId: "33524593667",
+  };
+  const stableEvidence = {
+    redirectCandidateEvidenceSha256: "9".repeat(64),
+    privacyOperationsEvidenceSha256: "a".repeat(64),
+    legacyWordPressRecoveryEvidenceSha256: "b".repeat(64),
+  };
+  const targets = {
+    cloudflare: {
+      accountId: "c".repeat(32),
+      zone: { id: null, name: "freshtowels.gr", type: "full" },
+      workerName: "fresh-towels-production",
+      workersDevSubdomain: null,
+      d1: {
+        jurisdiction: "eu",
+        primary: { id: null, name: "fresh-towels-leads-prod" },
+        recovery: { id: null, name: "fresh-towels-leads-prod-recovery" },
+      },
+      access: {
+        organization: { name: "Fresh Towels", teamDomain: null, sessionDuration: "8h" },
+        identityProvider: {
+          id: null,
+          name: "Fresh Towels owner OTP",
+          type: "onetimepin",
+        },
+        application: {
+          id: null,
+          name: "Fresh Towels Leads",
+          domain: "freshtowels.gr/internal/leads",
+          destinations: [
+            { type: "public", uri: "freshtowels.gr/api/internal/*" },
+            { type: "public", uri: "freshtowels.gr/internal/leads" },
+            { type: "public", uri: "freshtowels.gr/internal/leads/*" },
+          ],
+          type: "self_hosted",
+          sessionDuration: "8h",
+          httpOnlyCookieAttribute: true,
+          sameSiteCookieAttribute: "strict",
+          enableBindingCookie: true,
+          pathCookieAttribute: false,
+          allowIframe: false,
+          allowAuthenticateViaWarp: false,
+          skipInterstitial: false,
+          optionsPreflightBypass: false,
+          appLauncherVisible: false,
+          autoRedirectToIdentity: true,
+        },
+        policy: {
+          id: null,
+          name: "Fresh Towels owner access",
+          decision: "allow",
+          precedence: 1,
+          adminIdentitySha256: sha256(Buffer.from(adminIdentity)),
+        },
+      },
+    },
+    resend: {
+      domain: { id: "c63fd375-20ce-406a-a13a-85b0a85db733", name: "notify.freshtowels.gr", region: "eu-west-1" },
+      senderAddress: "notifications@notify.freshtowels.gr",
+      webhook: {
+        id: null,
+        endpoint: "https://freshtowels.gr/api/webhooks/resend",
+        events: ["email.sent", "email.delivered", "email.bounced", "email.complained", "email.delivery_delayed", "email.failed", "email.suppressed"],
+        secretBinding: "RESEND_WEBHOOK_SECRET",
+      },
+      sendingKey: {
+        id: null,
+        name: "Fresh Towels Production Worker",
+        permission: "sending_access",
+        secretBinding: "RESEND_API_KEY",
+      },
+    },
+  };
+  const createdAt = "2026-09-01T09:59:00.000Z";
+  const bootstrap = {
+    requestId: "",
+    intent: "provision-production-identities-and-issue-credential-free-receipt",
+    dnsStage: providerCanary,
+    stableEvidence,
+    targets,
+    safeguards: {
+      credentialsPresent: false,
+      applicationBuildAuthorized: false,
+      applicationArtifactPresent: false,
+      productionTrafficMutationAuthorized: false,
+      productionDnsMutationAuthorized: false,
+      providerBootstrapMutationAuthorized: true,
+    },
+  };
+  bootstrap.requestId = sha256(
+    Buffer.from(
+      `${canonicalJson({ application, controller, createdAt, dnsStage: providerCanary, stableEvidence, targets })}\n`,
+    ),
+  );
+  return {
+    application,
+    bootstrap,
+    capsuleType: "fresh-towels-production-bootstrap-capsule",
+    controller,
+    createdAt,
+    operation: "production-bootstrap",
+    schemaVersion: 1,
+    validUntil: "2026-09-01T11:59:00.000Z",
+  };
+}
+
+function productionBootstrapRequest(bytes) {
+  const value = request(Buffer.from("x"));
+  value.operation = "production-bootstrap";
+  value.source.repositoryId = "1350923567";
+  value.artifact.plaintextBytes = bytes.byteLength;
+  value.artifact.plaintextSha256 = sha256(bytes);
+  return value;
+}
+
+function productionCutoverCapsule() {
+  const application = {
+    repository: "zikosbozonis-beep/fresh-towels-website",
+    repositoryId: "1001",
+    ref: "refs/heads/main",
+    commitSha: "1".repeat(40),
+    workflowRef:
+      "zikosbozonis-beep/fresh-towels-website/.github/workflows/release-handoff.yml@refs/heads/main",
+    workflowSha: "1".repeat(40),
+    runId: "3003",
+    runAttempt: 1,
+  };
+  const controller = {
+    repository: "zikosbozonis-beep/fresh-towels-deployment-control",
+    commitSha: "2".repeat(40),
+    workflowRef: `zikosbozonis-beep/fresh-towels-deployment-control/.github/workflows/package-release.yml@${"2".repeat(40)}`,
+  };
+  const createdAt = "2026-09-01T09:59:00.000Z";
+  const prerequisite = {
+    requestId: "88888888-8888-4888-8888-888888888888",
+    runId: "33524599999",
+    receiptSha256: "9".repeat(64),
+    completedAt: "2026-09-01T09:58:00.000Z",
+  };
+  const safeguards = {
+    exactPrerequisiteRequired: true,
+    accessOwnerLoginRequired: true,
+    candidateEmailDeliveryRequired: true,
+    rollbackToPreCutoverRoutesRequired: true,
+    legacyWordPressPreserved: true,
+    productionTrafficMutationAuthorized: true,
+  };
+  const targets = {
+    zone: "freshtowels.gr",
+    worker: "fresh-towels-production",
+    candidateRoutes: [
+      "freshtowels.gr/api/internal/*",
+      "freshtowels.gr/api/leads",
+      "freshtowels.gr/api/webhooks/resend",
+      "freshtowels.gr/internal/leads",
+      "freshtowels.gr/internal/leads/*",
+    ],
+    preCutoverRoutes: [
+      "freshtowels.gr/api/internal/*",
+      "freshtowels.gr/internal/leads",
+      "freshtowels.gr/internal/leads/*",
+    ],
+    liveRoutes: ["freshtowels.gr/*", "www.freshtowels.gr/*"],
+  };
+  const cutover = {
+    cutoverId: "",
+    intent: "activate-exact-qualified-release-with-automatic-route-rollback",
+    prerequisite,
+    safeguards,
+    targets,
+  };
+  cutover.cutoverId = sha256(
+    Buffer.from(canonicalJson({ application, controller, createdAt, prerequisite, safeguards, targets })),
+  );
+  return {
+    application,
+    capsuleType: "fresh-towels-production-cutover-capsule",
+    controller,
+    createdAt,
+    cutover,
+    operation: "production-cutover",
+    schemaVersion: 1,
+    validUntil: "2026-09-01T11:59:00.000Z",
+  };
+}
+
+function productionCutoverRequest(bytes) {
+  const value = request(Buffer.from("x"));
+  value.operation = "production-cutover";
+  value.artifact.plaintextBytes = bytes.byteLength;
+  value.artifact.plaintextSha256 = sha256(bytes);
+  return value;
 }
 
 test("transport tree permits only two exact regular non-executable blobs", () => {
@@ -440,11 +656,106 @@ test("decrypted operation payload is type-separated and identity-bound", () => {
       ),
     /canary capsule/,
   );
-  assert.equal(
-    validateOperationPayload(
-      Buffer.from(`${JSON.stringify(productionCapsule())}\n`),
-      request(Buffer.from("x")),
-    ).operation,
-    "production-release",
+  assert.throws(
+    () =>
+      validateOperationPayload(
+        Buffer.from(`${JSON.stringify(productionCapsule())}\n`),
+        request(Buffer.from("x")),
+      ),
+    /entry|payload|capsule/,
+  );
+});
+
+test("production Bootstrap transport validates exact capsule, administrator hash, and prerequisite outputs", () => {
+  const adminIdentity = "owner-admin@example.net";
+  const capsule = productionBootstrapCapsule(adminIdentity);
+  const bytes = Buffer.from(`${canonicalJson(capsule)}\n`);
+  const bootstrapRequest = productionBootstrapRequest(bytes);
+  const validated = validateOperationPayload(bytes, bootstrapRequest, {
+    adminIdentity,
+    now: new Date("2026-09-01T10:00:00.000Z"),
+  });
+  assert.equal(validated.operation, "production-bootstrap");
+  assert.deepEqual(protectedOperationOutputs(validated, bootstrapRequest), {
+    capsule_request_sha256: capsule.bootstrap.requestId,
+    prerequisite_receipt_sha256: capsule.bootstrap.dnsStage.receiptSha256,
+    prerequisite_request_id: capsule.bootstrap.dnsStage.requestId,
+    prerequisite_run_id: capsule.bootstrap.dnsStage.runId,
+  });
+  assert.throws(
+    () =>
+      validateOperationPayload(bytes, bootstrapRequest, {
+        adminIdentity: "different@example.net",
+        now: new Date("2026-09-01T10:00:00.000Z"),
+      }),
+    /Access policy target|administrator identity|production bootstrap/,
+  );
+});
+
+test("production Bootstrap prerequisite tampering and cross-operation substitution fail closed", () => {
+  const adminIdentity = "owner-admin@example.net";
+  const capsule = productionBootstrapCapsule(adminIdentity);
+  capsule.bootstrap.dnsStage.runId = "33524593668";
+  const bytes = Buffer.from(`${canonicalJson(capsule)}\n`);
+  const bootstrapRequest = productionBootstrapRequest(bytes);
+  assert.throws(
+    () =>
+      validateOperationPayload(bytes, bootstrapRequest, {
+        adminIdentity,
+        now: new Date("2026-09-01T10:00:00.000Z"),
+      }),
+    /request identity|bootstrap/,
+  );
+  assert.throws(
+    () => validateOperationPayload(bytes, { ...bootstrapRequest, operation: "provider-canary" }),
+    /provider canary capsule/,
+  );
+});
+
+test("production Cutover transport is exact, canonical, and emits only prerequisite hashes", () => {
+  const capsule = productionCutoverCapsule();
+  const bytes = Buffer.from(`${canonicalJson(capsule)}\n`);
+  const cutoverRequest = productionCutoverRequest(bytes);
+  const validated = validateOperationPayload(bytes, cutoverRequest);
+  assert.equal(validated.operation, "production-cutover");
+  assert.deepEqual(protectedOperationOutputs(validated, cutoverRequest), {
+    capsule_request_sha256: capsule.cutover.cutoverId,
+    prerequisite_receipt_sha256: capsule.cutover.prerequisite.receiptSha256,
+    prerequisite_request_id: capsule.cutover.prerequisite.requestId,
+    prerequisite_run_id: capsule.cutover.prerequisite.runId,
+  });
+});
+
+test("production Cutover prerequisite, route, identity, and operation substitution fail closed", () => {
+  const original = productionCutoverCapsule();
+  for (const mutate of [
+    (value) => {
+      value.cutover.prerequisite.receiptSha256 = "0".repeat(64);
+    },
+    (value) => {
+      value.cutover.targets.liveRoutes.reverse();
+    },
+    (value) => {
+      value.cutover.targets.preCutoverRoutes = [];
+    },
+    (value) => {
+      value.application.commitSha = "3".repeat(40);
+    },
+    (value) => {
+      value.cutover.safeguards.accessOwnerLoginRequired = false;
+    },
+  ]) {
+    const capsule = structuredClone(original);
+    mutate(capsule);
+    const bytes = Buffer.from(`${canonicalJson(capsule)}\n`);
+    assert.throws(
+      () => validateOperationPayload(bytes, productionCutoverRequest(bytes)),
+      /cutover|capsule/,
+    );
+  }
+  const bytes = Buffer.from(`${canonicalJson(original)}\n`);
+  assert.throws(
+    () => validateOperationPayload(bytes, { ...productionCutoverRequest(bytes), operation: "production-release" }),
+    /production capsule/,
   );
 });

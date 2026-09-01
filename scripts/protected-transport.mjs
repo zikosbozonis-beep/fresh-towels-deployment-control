@@ -1,7 +1,16 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +20,10 @@ import {
   sha256,
   validateReleaseRequest,
 } from "./control-contract.mjs";
+import { validateProductionCapsuleContents } from "./production-capsule.mjs";
+import { validateProductionCutoverCapsule } from "./production-cutover-capsule.mjs";
+import { validateProductionDnsStageCapsule } from "./production-dns-stage.mjs";
+import { validateProductionBootstrapCapsule } from "./production-provider-bootstrap.mjs";
 
 const maximumEnvelopeBytes = 128 * 1024 * 1024;
 const shaPattern = /^[a-f0-9]{40}$/;
@@ -159,7 +172,102 @@ function validateCanaryCapsule(capsule, bytes, request) {
   validateCommonCapsuleIdentity(capsule, request);
 }
 
-function validateProductionCapsule(capsule, request) {
+function providerCanaryId(capsule) {
+  return sha256(
+    Buffer.from(
+      canonicalJson({
+        applicationCommitSha: capsule.application.commitSha,
+        controllerCommitSha: capsule.controller.commitSha,
+        createdAt: capsule.createdAt,
+        runAttempt: String(capsule.application.runAttempt),
+        runId: capsule.application.runId,
+        safeguards: capsule.providerCanary.safeguards,
+        targets: capsule.providerCanary.targets,
+      }),
+      "utf8",
+    ),
+  );
+}
+
+export function validateProviderCanaryCapsule(capsule, bytes, request) {
+  exactKeys(
+    capsule,
+    [
+      "application",
+      "capsuleType",
+      "controller",
+      "createdAt",
+      "operation",
+      "providerCanary",
+      "schemaVersion",
+      "validUntil",
+    ],
+    "provider canary capsule",
+  );
+  exactKeys(
+    capsule.providerCanary,
+    ["canaryId", "intent", "safeguards", "targets"],
+    "provider canary declaration",
+  );
+  exactKeys(
+    capsule.providerCanary.safeguards,
+    [
+      "cleanupRequired",
+      "productionAccessMutationAuthorized",
+      "productionD1MutationAuthorized",
+      "productionDnsMutationAuthorized",
+      "productionEmailAuthorized",
+      "productionTrafficMutationAuthorized",
+    ],
+    "provider canary safeguards",
+  );
+  exactKeys(
+    capsule.providerCanary.targets,
+    ["cloudflare", "resend"],
+    "provider canary targets",
+  );
+  exactKeys(
+    capsule.providerCanary.targets.cloudflare,
+    ["accountId", "jurisdiction"],
+    "provider canary Cloudflare target",
+  );
+  exactKeys(
+    capsule.providerCanary.targets.resend,
+    ["domain", "mutationAuthorized"],
+    "provider canary Resend target",
+  );
+  const safeguards = capsule.providerCanary.safeguards;
+  const cloudflare = capsule.providerCanary.targets.cloudflare;
+  const resend = capsule.providerCanary.targets.resend;
+  if (
+    capsule.schemaVersion !== 1 ||
+    capsule.capsuleType !== "fresh-towels-provider-canary-capsule" ||
+    capsule.operation !== "provider-canary" ||
+    capsule.providerCanary.intent !==
+      "verify-real-provider-adapter-on-disposable-non-production-resources" ||
+    capsule.providerCanary.canaryId !== providerCanaryId(capsule) ||
+    !digestPattern.test(capsule.providerCanary.canaryId ?? "") ||
+    safeguards.cleanupRequired !== true ||
+    Object.entries(safeguards)
+      .filter(([name]) => name !== "cleanupRequired")
+      .some(([, value]) => value !== false) ||
+    !/^[a-f0-9]{32}$/.test(cloudflare.accountId ?? "") ||
+    /^0+$/.test(cloudflare.accountId) ||
+    cloudflare.jurisdiction !== "eu" ||
+    resend.domain !== "notify.freshtowels.gr" ||
+    resend.mutationAuthorized !== false
+  ) {
+    throw new Error("provider canary declaration is invalid");
+  }
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  if (`${canonicalJson(capsule)}\n` !== text || bytes.byteLength > 8192) {
+    throw new Error("provider canary capsule is not canonical or exceeds its boundary");
+  }
+  validateCommonCapsuleIdentity(capsule, request);
+  return capsule;
+}
+
+function validateProductionCapsule(capsule, request, bytes) {
   exactKeys(
     capsule,
     [
@@ -171,13 +279,14 @@ function validateProductionCapsule(capsule, request) {
       "payload",
       "releaseId",
       "releaseIntegrity",
+      "releasePrerequisite",
       "schemaVersion",
       "validUntil",
     ],
     "production capsule",
   );
   if (
-    capsule.schemaVersion !== 1 ||
+    capsule.schemaVersion !== 2 ||
     capsule.capsuleType !== "fresh-towels-private-release-capsule" ||
     capsule.operation !== "production-release" ||
     typeof capsule.releaseId !== "string" ||
@@ -191,9 +300,10 @@ function validateProductionCapsule(capsule, request) {
       "buildArtifactSha256",
       "databaseSchemaSha256",
       "releaseApprovalManifestSha256",
-      "configurationSha256",
+      "configurationTemplateSha256",
       "uploadArtifactSha256",
       "capsuleTreeSha256",
+      "productionInfrastructureReceiptSha256",
     ],
     "production capsule integrity",
   );
@@ -223,9 +333,10 @@ function validateProductionCapsule(capsule, request) {
     throw new Error("production capsule payload boundary is invalid");
   }
   validateCommonCapsuleIdentity(capsule, request);
+  validateProductionCapsuleContents(capsule, bytes);
 }
 
-export function validateOperationPayload(payload, request) {
+export function validateOperationPayload(payload, request, options = {}) {
   let capsule;
   try {
     capsule = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(payload));
@@ -234,12 +345,122 @@ export function validateOperationPayload(payload, request) {
   }
   if (request.operation === "canary") {
     validateCanaryCapsule(capsule, payload, request);
+  } else if (request.operation === "provider-canary") {
+    validateProviderCanaryCapsule(capsule, payload, request);
+  } else if (request.operation === "production-dns-stage") {
+    validateCommonCapsuleIdentity(capsule, request);
+    validateProductionDnsStageCapsule({
+      capsule,
+      capsuleBytes: Buffer.from(payload),
+      expectedCapsuleSha256: request.artifact.plaintextSha256,
+      now: options.now ?? new Date(),
+    });
+  } else if (request.operation === "production-bootstrap") {
+    validateCommonCapsuleIdentity(capsule, request);
+    validateProductionBootstrapCapsule({
+      capsule,
+      capsuleBytes: Buffer.from(payload),
+      expectedCapsuleSha256: request.artifact.plaintextSha256,
+      adminIdentity: options.adminIdentity,
+      now: options.now ?? new Date(),
+    });
   } else if (request.operation === "production-release") {
-    validateProductionCapsule(capsule, request);
+    validateProductionCapsule(capsule, request, payload);
+  } else if (request.operation === "production-cutover") {
+    validateCommonCapsuleIdentity(capsule, request);
+    validateProductionCutoverCapsule(capsule, payload);
   } else {
     throw new Error("release operation is unsupported");
   }
   return capsule;
+}
+
+export function protectedOperationOutputs(capsule, request) {
+  if (request.operation === "production-dns-stage") {
+    const prerequisite = capsule?.dnsStage?.providerCanary;
+    if (
+      capsule?.operation !== "production-dns-stage" ||
+      !digestPattern.test(capsule?.dnsStage?.requestId ?? "") ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+        prerequisite?.requestId ?? "",
+      ) ||
+      !digestPattern.test(prerequisite?.receiptSha256 ?? "") ||
+      !decimalPattern.test(prerequisite?.runId ?? "")
+    ) {
+      throw new Error("production DNS-stage prerequisite outputs are invalid");
+    }
+    return Object.freeze({
+      capsule_request_sha256: capsule.dnsStage.requestId,
+      prerequisite_receipt_sha256: prerequisite.receiptSha256,
+      prerequisite_request_id: prerequisite.requestId,
+      prerequisite_run_id: prerequisite.runId,
+    });
+  }
+  if (request.operation === "production-bootstrap") {
+    const dnsStage = capsule?.bootstrap?.dnsStage;
+    if (
+      capsule?.operation !== "production-bootstrap" ||
+      !digestPattern.test(capsule?.bootstrap?.requestId ?? "") ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+        dnsStage?.requestId ?? "",
+      ) ||
+      !digestPattern.test(dnsStage?.receiptSha256 ?? "") ||
+      !decimalPattern.test(dnsStage?.runId ?? "")
+    ) {
+      throw new Error("production bootstrap prerequisite outputs are invalid");
+    }
+    return Object.freeze({
+      capsule_request_sha256: capsule.bootstrap.requestId,
+      prerequisite_receipt_sha256: dnsStage.receiptSha256,
+      prerequisite_request_id: dnsStage.requestId,
+      prerequisite_run_id: dnsStage.runId,
+    });
+  }
+  if (request.operation === "production-release") {
+    const prerequisite = capsule?.releasePrerequisite;
+    if (
+      capsule?.operation !== "production-release" ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+        prerequisite?.requestId ?? "",
+      ) ||
+      !digestPattern.test(prerequisite?.receiptSha256 ?? "") ||
+      !decimalPattern.test(prerequisite?.runId ?? "")
+    ) {
+      throw new Error("production release prerequisite outputs are invalid");
+    }
+    return Object.freeze({
+      prerequisite_receipt_sha256: prerequisite.receiptSha256,
+      prerequisite_request_id: prerequisite.requestId,
+      prerequisite_run_id: prerequisite.runId,
+    });
+  }
+  if (request.operation === "production-cutover") {
+    const prerequisite = capsule?.cutover?.prerequisite;
+    if (
+      capsule?.operation !== "production-cutover" ||
+      !digestPattern.test(capsule?.cutover?.cutoverId ?? "") ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+        prerequisite?.requestId ?? "",
+      ) ||
+      !digestPattern.test(prerequisite?.receiptSha256 ?? "") ||
+      !decimalPattern.test(prerequisite?.runId ?? "")
+    ) {
+      throw new Error("production cutover prerequisite outputs are invalid");
+    }
+    return Object.freeze({
+      capsule_request_sha256: capsule.cutover.cutoverId,
+      prerequisite_receipt_sha256: prerequisite.receiptSha256,
+      prerequisite_request_id: prerequisite.requestId,
+      prerequisite_run_id: prerequisite.runId,
+    });
+  }
+  return Object.freeze({});
+}
+
+async function appendProtectedOperationOutputs(path, outputs) {
+  if (!path || Object.keys(outputs).length === 0) return;
+  const lines = Object.entries(outputs).map(([name, value]) => `${name}=${value}`);
+  await appendFile(resolve(path), `${lines.join("\n")}\n`, "utf8");
 }
 
 function required(environment, name, pattern) {
@@ -740,11 +961,24 @@ export async function verifyProtectedTransport(environment = process.env) {
     ) {
       throw new Error("Plaintext capsule digest changed");
     }
-    validateOperationPayload(payload, request);
+    const capsule = validateOperationPayload(payload, request, {
+      adminIdentity:
+        request.operation === "production-bootstrap"
+          ? required(
+              environment,
+              "PRODUCTION_ACCESS_ADMIN_EMAIL",
+              /^[^\s,@]+@[^\s,@]+\.[^\s,@]+$/,
+            )
+          : undefined,
+    });
     const outputDirectory = resolve(required(environment, "VERIFIED_PAYLOAD_OUTPUT_DIRECTORY"));
     await mkdir(outputDirectory, { recursive: false, mode: 0o700 });
     const output = join(outputDirectory, "release-capsule.bin");
     await writeFile(output, payload, { flag: "wx", mode: 0o400 });
+    await appendProtectedOperationOutputs(
+      environment.GITHUB_OUTPUT,
+      protectedOperationOutputs(capsule, request),
+    );
     return Object.freeze({ output, request });
   } finally {
     await rm(root, { force: true, recursive: true });
