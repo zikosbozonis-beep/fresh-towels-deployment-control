@@ -21,6 +21,7 @@ import { validateProviderCanaryCapsule } from "./protected-transport.mjs";
 const digestPattern = /^[a-f0-9]{64}$/;
 const commitPattern = /^[a-f0-9]{40}$/;
 const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+const workerIdPattern = /^[a-f0-9]{32}$/;
 const requestIdPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const accountIdPattern = /^[a-f0-9]{32}$/;
 const domainPattern = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
@@ -43,6 +44,42 @@ export class ProviderCanaryError extends Error {
     this.name = "ProviderCanaryError";
     this.code = code;
   }
+}
+
+export function classifyProviderCanaryFailure(error, provider) {
+  if (error instanceof ProviderCanaryError) return error;
+  if (!["cloudflare", "resend"].includes(provider)) {
+    return new ProviderCanaryError("provider-response-invalid");
+  }
+  if (error instanceof ProviderRejectedError) {
+    if (
+      error.status === 401 ||
+      (provider === "resend" && error.providerErrorCode === "invalid_api_key")
+    ) {
+      return new ProviderCanaryError(`${provider}-auth-failed`);
+    }
+    if (
+      error.status === 403 ||
+      (provider === "resend" && error.providerErrorCode === "restricted_api_key")
+    ) {
+      return new ProviderCanaryError(`${provider}-scope-failed`);
+    }
+    if (error.status === 404) {
+      return new ProviderCanaryError(`${provider}-resource-mismatch`);
+    }
+    return new ProviderCanaryError(`${provider}-response-invalid`);
+  }
+  if (error instanceof ProviderTransportAmbiguousError) {
+    if (
+      error.code === "network-or-timeout" ||
+      error.code === "response-read" ||
+      /^http-(?:408|425|429|5[0-9]{2})$/.test(error.code ?? "")
+    ) {
+      return new ProviderCanaryError(`${provider}-network-failure`);
+    }
+    return new ProviderCanaryError(`${provider}-response-invalid`);
+  }
+  return new ProviderCanaryError(`${provider}-response-invalid`);
 }
 
 function fail(code) {
@@ -205,7 +242,7 @@ async function providerRequest(client, provider, input) {
     if (error instanceof ProviderRejectedError || error instanceof ProviderTransportAmbiguousError) {
       throw error;
     }
-    fail("provider-client-contract");
+    fail(`${provider}-response-invalid`);
   }
 }
 
@@ -417,6 +454,122 @@ function workerMultipart(release, name) {
   });
 }
 
+function validateWorkerContainer(value, { expectedId = null, expectedName }) {
+  if (
+    !isPlainObject(value) ||
+    !workerIdPattern.test(value.id ?? "") ||
+    value.name !== expectedName ||
+    (expectedId !== null && value.id !== expectedId) ||
+    value.deployed_on !== null ||
+    !isPlainObject(value.subdomain) ||
+    value.subdomain.enabled !== false ||
+    value.subdomain.previews_enabled !== false ||
+    !Array.isArray(value.tags) ||
+    value.tags.length !== 1 ||
+    value.tags[0] !== "fresh-towels-provider-canary"
+  ) {
+    fail("worker-container-substitution");
+  }
+  return Object.freeze({ id: value.id, name: value.name });
+}
+
+async function getWorkerContainer(client, accountId, identifier, expectedName) {
+  let response;
+  try {
+    response = await providerRequest(
+      client,
+      "cloudflare",
+      request("GET", `/accounts/${accountId}/workers/workers/${identifier}`),
+    );
+  } catch (error) {
+    if (error instanceof ProviderRejectedError && error.status === 404) {
+      return Object.freeze({ record: null, requestEvidenceSha256: canonicalDigest("404") });
+    }
+    throw error;
+  }
+  const record = validateWorkerContainer(response.result, {
+    expectedId: workerIdPattern.test(identifier) ? identifier : null,
+    expectedName,
+  });
+  return Object.freeze({
+    record,
+    requestEvidenceSha256: requestEvidence(response),
+    stateSha256: canonicalDigest({
+      deployed: false,
+      id: record.id,
+      name: record.name,
+      previewsEnabled: false,
+      subdomainEnabled: false,
+      tags: ["fresh-towels-provider-canary"],
+    }),
+  });
+}
+
+async function getWorkerIdentityForCleanup(client, accountId, expectedName) {
+  let response;
+  try {
+    response = await providerRequest(
+      client,
+      "cloudflare",
+      request("GET", `/accounts/${accountId}/workers/workers/${expectedName}`),
+    );
+  } catch (error) {
+    if (error instanceof ProviderRejectedError && error.status === 404) return null;
+    throw error;
+  }
+  if (
+    !isPlainObject(response.result) ||
+    !workerIdPattern.test(response.result.id ?? "") ||
+    response.result.name !== expectedName
+  ) {
+    fail("worker-cleanup-identity-untrusted");
+  }
+  return Object.freeze({ id: response.result.id, name: response.result.name });
+}
+
+async function createWorkerContainer(client, accountId, name, idempotencyKey) {
+  const body = {
+    name,
+    subdomain: { enabled: false, previews_enabled: false },
+    tags: ["fresh-towels-provider-canary"],
+  };
+  let response = null;
+  let responseRecord = null;
+  try {
+    response = await providerRequest(
+      client,
+      "cloudflare",
+      request("POST", `/accounts/${accountId}/workers/workers`, {
+        body,
+        bodySha256: canonicalDigest(body),
+        idempotencyKey,
+      }),
+    );
+    try {
+      responseRecord = validateWorkerContainer(response.result, { expectedName: name });
+    } catch (error) {
+      if (!(error instanceof ProviderCanaryError)) throw error;
+    }
+  } catch (error) {
+    if (!(error instanceof ProviderTransportAmbiguousError)) throw error;
+  }
+  const observed = await getWorkerContainer(client, accountId, name, name);
+  if (observed.record === null) fail("worker-container-create-ambiguous");
+  if (response !== null && responseRecord === null) fail("worker-container-create-substitution");
+  if (responseRecord !== null && responseRecord.id !== observed.record.id) {
+    fail("worker-container-create-substitution");
+  }
+  return Object.freeze({
+    record: observed.record,
+    stateSha256: canonicalDigest({
+      createRequestEvidenceSha256:
+        response === null ? canonicalDigest("ambiguous") : requestEvidence(response),
+      observedStateSha256: observed.stateSha256,
+      reconcileRequestEvidenceSha256: observed.requestEvidenceSha256,
+    }),
+  });
+}
+
 async function getWorkerSettings(client, accountId, name, upload) {
   const response = await providerRequest(
     client,
@@ -485,44 +638,84 @@ async function listWorkerVersions(client, accountId, name) {
   });
 }
 
-async function getWorkerVersion(client, accountId, name, versionId, upload) {
-  const response = await providerRequest(
-    client,
-    "cloudflare",
-    request("GET", `/accounts/${accountId}/workers/scripts/${name}/versions/${versionId}`),
-  );
-  const value = response.result;
+function validateWorkerVersionState(
+  value,
+  { expectedProviderEtag = null, expectedVersionId, upload },
+) {
+  const expectedAnnotations = upload.metadata.annotations;
   if (
     !isPlainObject(value) ||
-    value.id !== versionId ||
+    value.id !== expectedVersionId ||
+    !isPlainObject(value.annotations) ||
+    value.annotations["workers/message"] !== expectedAnnotations["workers/message"] ||
+    value.annotations["workers/tag"] !== expectedAnnotations["workers/tag"] ||
+    Object.keys(value.annotations).some(
+      (key) => !["workers/message", "workers/tag", "workers/triggered_by"].includes(key),
+    ) ||
     !isPlainObject(value.resources) ||
     !isPlainObject(value.resources.script) ||
-    value.resources.script.etag !== upload.moduleSha256 ||
+    !digestPattern.test(value.resources.script.etag ?? "") ||
+    (expectedProviderEtag !== null && value.resources.script.etag !== expectedProviderEtag) ||
     !isPlainObject(value.resources.script_runtime) ||
     value.resources.script_runtime.compatibility_date !== upload.metadata.compatibility_date ||
     (value.resources.script_runtime.compatibility_flags !== undefined &&
       (!Array.isArray(value.resources.script_runtime.compatibility_flags) ||
         value.resources.script_runtime.compatibility_flags.length !== 0)) ||
-    (value.resources.bindings !== undefined &&
-      (!Array.isArray(value.resources.bindings) || value.resources.bindings.length !== 0))
+    !Array.isArray(value.resources.bindings) ||
+    value.resources.bindings.length !== 0
   ) {
     fail("worker-version-detail-substitution");
   }
   return Object.freeze({
+    providerEtag: value.resources.script.etag,
     stateSha256: canonicalDigest({
+      annotations: expectedAnnotations,
       bindings: [],
       compatibilityDate: value.resources.script_runtime.compatibility_date,
-      scriptSha256: value.resources.script.etag,
-      versionId,
+      moduleSha256: upload.moduleSha256,
+      providerEtag: value.resources.script.etag,
+      versionId: expectedVersionId,
     }),
+  });
+}
+
+async function getWorkerVersion(
+  client,
+  accountId,
+  name,
+  versionId,
+  upload,
+  expectedProviderEtag,
+) {
+  const response = await providerRequest(
+    client,
+    "cloudflare",
+    request("GET", `/accounts/${accountId}/workers/scripts/${name}/versions/${versionId}`),
+  );
+  const state = validateWorkerVersionState(response.result, {
+    expectedProviderEtag,
+    expectedVersionId: versionId,
+    upload,
+  });
+  return Object.freeze({
+    providerEtag: state.providerEtag,
+    stateSha256: state.stateSha256,
     requestEvidenceSha256: requestEvidence(response),
   });
 }
 
-async function createWorkerVersion(client, accountId, name, release, idempotencyKey) {
+async function createWorkerVersion(
+  client,
+  accountId,
+  container,
+  release,
+  idempotencyKey,
+) {
+  const name = container.name;
   const upload = workerMultipart(release, name);
   let response = null;
   let versionId = null;
+  let createdVersionState = null;
   try {
     response = await providerRequest(
       client,
@@ -537,6 +730,10 @@ async function createWorkerVersion(client, accountId, name, release, idempotency
       response = null;
     } else {
       versionId = response.result.id;
+      createdVersionState = validateWorkerVersionState(response.result, {
+        expectedVersionId: versionId,
+        upload,
+      });
     }
   } catch (error) {
     if (!(error instanceof ProviderTransportAmbiguousError)) throw error;
@@ -551,8 +748,16 @@ async function createWorkerVersion(client, accountId, name, release, idempotency
     name,
     versionId,
     upload,
+    createdVersionState?.providerEtag ?? null,
   );
   const settings = await getWorkerSettings(client, accountId, name, upload);
+  const containerAfterUpload = await getWorkerContainer(
+    client,
+    accountId,
+    container.id,
+    name,
+  );
+  if (containerAfterUpload.record === null) fail("worker-container-disappeared");
   return Object.freeze({
     desiredStateSha256: upload.desiredStateSha256,
     versionId,
@@ -564,31 +769,37 @@ async function createWorkerVersion(client, accountId, name, release, idempotency
       observedStateSha256: detail.stateSha256,
       settingsRequestEvidenceSha256: settings.requestEvidenceSha256,
       settingsStateSha256: settings.stateSha256,
+      containerRequestEvidenceSha256: containerAfterUpload.requestEvidenceSha256,
+      containerStateSha256: containerAfterUpload.stateSha256,
       reconcileRequestEvidenceSha256: observed.requestEvidenceSha256,
       versionIdentitySha256: canonicalDigest(versionId),
     }),
   });
 }
 
-async function deleteWorkerAndReconcile(client, accountId, name) {
+async function deleteWorkerAndReconcile(client, accountId, record) {
   let deletion = null;
   let deletionError = null;
   try {
     deletion = await providerRequest(
       client,
       "cloudflare",
-      request("DELETE", `/accounts/${accountId}/workers/scripts/${name}`),
+      request("DELETE", `/accounts/${accountId}/workers/workers/${record.id}`),
     );
   } catch (error) {
     deletionError = error;
   }
-  let observed;
+  let observedById;
+  let observedByName;
   try {
-    observed = await listWorkerVersions(client, accountId, name);
+    observedById = await getWorkerContainer(client, accountId, record.id, record.name);
+    observedByName = await getWorkerContainer(client, accountId, record.name, record.name);
   } catch {
     fail("worker-cleanup-reconciliation-unavailable");
   }
-  if (observed.exists) fail("worker-cleanup-not-proven");
+  if (observedById.record !== null || observedByName.record !== null) {
+    fail("worker-cleanup-not-proven");
+  }
   if (
     deletionError !== null &&
     !(deletionError instanceof ProviderTransportAmbiguousError) &&
@@ -599,8 +810,9 @@ async function deleteWorkerAndReconcile(client, accountId, name) {
   return canonicalDigest({
     deleteRequestEvidenceSha256:
       deletion === null ? canonicalDigest("reconciled-after-error") : requestEvidence(deletion),
-    reconcileRequestEvidenceSha256: observed.requestEvidenceSha256,
-    resourceIdentitySha256: canonicalDigest(name),
+    reconcileByIdRequestEvidenceSha256: observedById.requestEvidenceSha256,
+    reconcileByNameRequestEvidenceSha256: observedByName.requestEvidenceSha256,
+    resourceIdentitySha256: canonicalDigest(record),
     state: "absent",
   });
 }
@@ -768,27 +980,35 @@ export async function runProviderCanary({
     release: verifiedRelease,
     resourceName,
   });
-  const cloudflareAccountStateSha256 = await verifyCloudflareAccount(
-    cloudflareClient,
-    expectedCloudflareAccountId,
-  );
-  const initialD1 = await listD1ByName(
-    cloudflareClient,
-    expectedCloudflareAccountId,
-    resourceName,
-  );
-  if (initialD1.record !== null) fail("d1-previous-execution-ambiguous");
-  const initialWorker = await listWorkerVersions(
-    cloudflareClient,
-    expectedCloudflareAccountId,
-    resourceName,
-  );
-  if (initialWorker.exists) fail("worker-previous-execution-ambiguous");
+  let cloudflareAccountStateSha256;
+  try {
+    cloudflareAccountStateSha256 = await verifyCloudflareAccount(
+      cloudflareClient,
+      expectedCloudflareAccountId,
+    );
+    const initialD1 = await listD1ByName(
+      cloudflareClient,
+      expectedCloudflareAccountId,
+      resourceName,
+    );
+    if (initialD1.record !== null) fail("d1-previous-execution-ambiguous");
+    const initialWorker = await getWorkerContainer(
+      cloudflareClient,
+      expectedCloudflareAccountId,
+      resourceName,
+      resourceName,
+    );
+    if (initialWorker.record !== null) fail("worker-previous-execution-ambiguous");
+  } catch (error) {
+    throw classifyProviderCanaryFailure(error, "cloudflare");
+  }
 
   let d1Record = null;
   let d1CreateAttempted = false;
+  let workerRecord = null;
   let workerCreateAttempted = false;
   let primaryError = null;
+  let primaryProvider = "cloudflare";
   let d1DesiredStateSha256 = canonicalDigest({ jurisdiction: "eu", name: resourceName });
   let d1VerifiedStateSha256 = canonicalDigest("not-verified");
   let d1DeletedStateSha256 = canonicalDigest("not-deleted");
@@ -815,14 +1035,25 @@ export async function runProviderCanary({
       ),
     });
     workerCreateAttempted = true;
-    const worker = await createWorkerVersion(
+    const workerContainer = await createWorkerContainer(
       cloudflareClient,
       expectedCloudflareAccountId,
       resourceName,
+      canonicalDigest({ idempotencyRoot, step: "worker-container-create" }),
+    );
+    workerRecord = workerContainer.record;
+    const worker = await createWorkerVersion(
+      cloudflareClient,
+      expectedCloudflareAccountId,
+      workerRecord,
       verifiedRelease,
       canonicalDigest({ idempotencyRoot, step: "worker-version-create" }),
     );
-    workerVerifiedStateSha256 = worker.stateSha256;
+    workerVerifiedStateSha256 = canonicalDigest({
+      containerStateSha256: workerContainer.stateSha256,
+      versionStateSha256: worker.stateSha256,
+    });
+    primaryProvider = "resend";
     resendDomainStateSha256 = await verifyResendDomain(resendClient, expectedResendDomain);
   } catch (error) {
     primaryError = error;
@@ -830,11 +1061,20 @@ export async function runProviderCanary({
     let cleanupError = null;
     if (workerCreateAttempted) {
       try {
-        workerDeletedStateSha256 = await deleteWorkerAndReconcile(
-          cloudflareClient,
-          expectedCloudflareAccountId,
-          resourceName,
-        );
+        if (workerRecord === null) {
+          workerRecord = await getWorkerIdentityForCleanup(
+            cloudflareClient,
+            expectedCloudflareAccountId,
+            resourceName,
+          );
+        }
+        if (workerRecord !== null) {
+          workerDeletedStateSha256 = await deleteWorkerAndReconcile(
+            cloudflareClient,
+            expectedCloudflareAccountId,
+            workerRecord,
+          );
+        }
       } catch (error) {
         cleanupError = error;
       }
@@ -864,7 +1104,9 @@ export async function runProviderCanary({
     }
     if (cleanupError !== null) fail("disposable-cleanup-not-proven");
   }
-  if (primaryError !== null) throw primaryError;
+  if (primaryError !== null) {
+    throw classifyProviderCanaryFailure(primaryError, primaryProvider);
+  }
   const body = receiptBody({
     release: verifiedRelease,
     completedAt: canonicalInstant(now),

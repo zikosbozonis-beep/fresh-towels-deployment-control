@@ -23,6 +23,8 @@ const accountId = "0123456789abcdef".repeat(2);
 const targetDomain = "notify.freshtowels.gr";
 const databaseId = "11111111-1111-4111-8111-111111111111";
 const versionId = "22222222-2222-4222-8222-222222222222";
+const workerId = "33333333333333333333333333333333";
+const providerEtag = "4".repeat(64);
 
 function trustedProviderCanaryFixture() {
   const createdAt = "2026-09-01T17:00:00.000Z";
@@ -153,7 +155,7 @@ function cloudflareFixture(options = {}) {
       ? { jurisdiction: "eu", name: options.preexistingDatabase, uuid: databaseId }
       : null,
     worker: options.preexistingWorker
-      ? { name: options.preexistingWorker, versionId }
+      ? { id: workerId, name: options.preexistingWorker, versionId: null }
       : null,
     sequence: 0,
     calls: [],
@@ -211,8 +213,84 @@ function cloudflareFixture(options = {}) {
       const versionsPath = /^\/accounts\/[a-f0-9]{32}\/workers\/scripts\/([^/]+)\/versions$/;
       const versionDetailPath = /^\/accounts\/[a-f0-9]{32}\/workers\/scripts\/([^/]+)\/versions\/([a-f0-9-]{36})$/;
       const settingsPath = /^\/accounts\/[a-f0-9]{32}\/workers\/scripts\/([^/]+)\/settings$/;
-      const scriptPath = /^\/accounts\/[a-f0-9]{32}\/workers\/scripts\/([^/]+)$/;
-      let match = input.path.match(versionsPath);
+      const workerCollectionPath = new RegExp(`^/accounts/${accountId}/workers/workers$`);
+      const workerDetailPath = new RegExp(
+        `^/accounts/${accountId}/workers/workers/([a-z0-9-]+)$`,
+      );
+      const workerEnvelope = () => ({
+        id: options.substituteWorkerContainerId ? "4".repeat(32) : state.worker.id,
+        name: options.substituteWorkerContainerName ? "ft-provider-canary-substituted" : state.worker.name,
+        deployed_on: options.workerContainerDeployed
+          ? "2026-09-01T17:00:00.000Z"
+          : null,
+        subdomain: {
+          enabled: options.workerSubdomainEnabled ?? false,
+          previews_enabled: options.workerPreviewsEnabled ?? false,
+          preview_url_suffix: `-${state.worker.name}.example.workers.dev`,
+          url: `https://${state.worker.name}.example.workers.dev`,
+        },
+        tags: options.substituteWorkerTags
+          ? ["unexpected"]
+          : ["fresh-towels-provider-canary"],
+      });
+      const versionEnvelope = ({ detail = false } = {}) => ({
+        annotations: {
+          "workers/message": options.substituteWorkerAnnotations
+            ? "provider-canary:substituted"
+            : `provider-canary:${release().applicationCommitSha}:${sha256(
+                Buffer.from(
+                  'export default { fetch() { return new Response("provider-canary"); } };\n',
+                  "utf8",
+                ),
+              )}`,
+          "workers/tag": release().releaseId.slice(0, 32),
+          "workers/triggered_by": "upload",
+        },
+        id: versionId,
+        resources: {
+          bindings: [],
+          script: {
+            etag: detail && options.substituteWorkerContent ? "0".repeat(64) : providerEtag,
+          },
+          script_runtime: {
+            compatibility_date: options.substituteWorkerCompatibilityDate
+              ? "2026-08-30"
+              : "2026-08-31",
+          },
+        },
+      });
+      let match = input.path.match(workerCollectionPath);
+      if (match && input.method === "POST") {
+        state.worker = { id: workerId, name: input.body.name, versionId: null };
+        if (options.ambiguousWorkerContainerCreate) {
+          throw new ProviderTransportAmbiguousError("synthetic-worker-container-create-timeout");
+        }
+        return respond(workerEnvelope());
+      }
+      match = input.path.match(workerDetailPath);
+      if (match && input.method === "GET") {
+        if (
+          state.worker === null ||
+          ![state.worker.id, state.worker.name].includes(match[1])
+        ) {
+          throw new ProviderRejectedError(404);
+        }
+        return respond(workerEnvelope());
+      }
+      if (match && input.method === "DELETE") {
+        if (
+          state.worker === null ||
+          ![state.worker.id, state.worker.name].includes(match[1])
+        ) {
+          throw new ProviderRejectedError(404);
+        }
+        if (!options.retainWorkerOnDelete) state.worker = null;
+        if (options.ambiguousWorkerDelete) {
+          throw new ProviderTransportAmbiguousError("synthetic-worker-delete-timeout");
+        }
+        return respond({});
+      }
+      match = input.path.match(versionsPath);
       if (match && input.method === "GET") {
         if (state.worker === null || state.worker.name !== match[1]) {
           throw new ProviderRejectedError(404);
@@ -220,11 +298,14 @@ function cloudflareFixture(options = {}) {
         return respond({ items: [{ id: state.worker.versionId, metadata: {}, number: 1 }] });
       }
       if (match && input.method === "POST") {
-        state.worker = { name: match[1], versionId };
+        if (state.worker === null || state.worker.name !== match[1]) {
+          throw new ProviderRejectedError(404);
+        }
+        state.worker.versionId = versionId;
         if (options.ambiguousWorkerCreate) {
           throw new ProviderTransportAmbiguousError("synthetic-worker-create-timeout");
         }
-        return respond({ id: versionId, resources: {} });
+        return respond(versionEnvelope());
       }
       match = input.path.match(versionDetailPath);
       if (match && input.method === "GET") {
@@ -235,34 +316,15 @@ function cloudflareFixture(options = {}) {
         ) {
           throw new ProviderRejectedError(404);
         }
-        return respond({
-          id: versionId,
-          metadata: { source: "api" },
-          number: 1,
-          resources: {
-            bindings: [],
-            script: {
-              etag: options.substituteWorkerContent
-                ? "0".repeat(64)
-                : sha256(
-                Buffer.from(
-                  'export default { fetch() { return new Response("provider-canary"); } };\n',
-                  "utf8",
-                ),
-              ),
-            },
-            script_runtime: {
-              compatibility_date: options.substituteWorkerCompatibilityDate
-                ? "2026-08-30"
-                : "2026-08-31",
-              compatibility_flags: [],
-            },
-          },
-        });
+        return respond({ ...versionEnvelope({ detail: true }), metadata: { source: "api" }, number: 1 });
       }
       match = input.path.match(settingsPath);
       if (match && input.method === "GET") {
-        if (state.worker === null || state.worker.name !== match[1]) {
+        if (
+          state.worker === null ||
+          state.worker.name !== match[1] ||
+          state.worker.versionId === null
+        ) {
           throw new ProviderRejectedError(404);
         }
         const moduleSha256 = sha256(
@@ -283,14 +345,6 @@ function cloudflareFixture(options = {}) {
           compatibility_flags: [],
         });
       }
-      match = input.path.match(scriptPath);
-      if (match && input.method === "DELETE") {
-        if (!options.retainWorkerOnDelete) state.worker = null;
-        if (options.ambiguousWorkerDelete) {
-          throw new ProviderTransportAmbiguousError("synthetic-worker-delete-timeout");
-        }
-        return respond({});
-      }
       throw new Error(`unexpected synthetic Cloudflare request: ${input.method} ${input.path}`);
     },
   };
@@ -299,11 +353,14 @@ function cloudflareFixture(options = {}) {
 
 function resendFixture(options = {}) {
   let sequence = 0;
-  return {
+  const client = {
+    calls: [],
     async request(input) {
+      client.calls.push(input);
       sequence += 1;
       assert.equal(input.method, "GET");
       assert.equal(input.path, "/domains");
+      if (options.error) throw options.error;
       const domainName = options.domainName ?? targetDomain;
       return providerResponse(
         "resend",
@@ -327,6 +384,7 @@ function resendFixture(options = {}) {
       );
     },
   };
+  return client;
 }
 
 async function execute(options = {}) {
@@ -421,6 +479,19 @@ test("bounded provider canary verifies account, creates/queries/deletes EU D1, v
   assert.equal(cf.state.worker, null);
   assert.ok(cf.state.calls.some((call) => call.method === "POST" && call.path.endsWith("/d1/database")));
   assert.ok(cf.state.calls.some((call) => call.method === "POST" && call.path.endsWith("/query")));
+  const workerContainerCreateIndex = cf.state.calls.findIndex(
+    (call) => call.method === "POST" && call.path.endsWith("/workers/workers"),
+  );
+  const workerVersionCreateIndex = cf.state.calls.findIndex(
+    (call) => call.method === "POST" && call.path.endsWith("/versions"),
+  );
+  assert.ok(workerContainerCreateIndex >= 0);
+  assert.ok(workerVersionCreateIndex > workerContainerCreateIndex);
+  assert.deepEqual(cf.state.calls[workerContainerCreateIndex].body, {
+    name: deriveProviderCanaryResourceName(release()),
+    subdomain: { enabled: false, previews_enabled: false },
+    tags: ["fresh-towels-provider-canary"],
+  });
   assert.ok(cf.state.calls.some((call) => call.method === "POST" && call.path.endsWith("/versions")));
   const workerUpload = cf.state.calls.find(
     (call) => call.method === "POST" && call.path.endsWith("/versions"),
@@ -429,10 +500,119 @@ test("bounded provider canary verifies account, creates/queries/deletes EU D1, v
   assert.ok(workerUploadText.includes('"workers/message"'));
   assert.ok(workerUploadText.includes('"workers/tag"'));
   assert.ok(!workerUploadText.includes("workers/commit_sha"));
-  assert.ok(!cf.state.calls.some((call) => /dns_records|workers\/routes|deployments/.test(call.path)));
+  assert.ok(
+    !cf.state.calls.some((call) =>
+      /dns_records|workers\/routes|deployments|\/subdomain$/.test(call.path),
+    ),
+  );
   assert.ok(Object.keys(receipt).filter((key) => key.includes("State")).every((key) => /^[a-f0-9]{64}$/.test(receipt[key])));
   assert.ok(!JSON.stringify(receipt).includes(targetDomain));
   assert.ok(!JSON.stringify(receipt).includes(accountId));
+});
+
+test("Cloudflare version upload cannot create a missing Worker parent", async () => {
+  const cf = cloudflareFixture();
+  await assert.rejects(
+    cf.client.request({
+      method: "POST",
+      path: `/accounts/${accountId}/workers/scripts/${deriveProviderCanaryResourceName(release())}/versions`,
+    }),
+    (error) => error instanceof ProviderRejectedError && error.status === 404,
+  );
+  assert.equal(cf.state.worker, null);
+});
+
+test("Worker parent identity, deployment and subdomain drift fail closed and are cleaned", async () => {
+  for (const cloudflare of [
+    { substituteWorkerContainerName: true },
+    { substituteWorkerTags: true },
+    { workerContainerDeployed: true },
+    { workerSubdomainEnabled: true },
+    { workerPreviewsEnabled: true },
+  ]) {
+    const cf = cloudflareFixture(cloudflare);
+    await assert.rejects(
+      runProviderCanary({
+        release: release(),
+        expectedRelease: release(),
+        expectedCloudflareAccountId: accountId,
+        expectedResendDomain: targetDomain,
+        cloudflareClient: cf.client,
+        resendClient: resendFixture(),
+      }),
+      (error) =>
+        error instanceof ProviderCanaryError &&
+        ["worker-container-substitution", "disposable-cleanup-not-proven"].includes(error.code),
+    );
+    assert.ok(!cf.state.calls.some((call) => /dns_records|workers\/routes|deployments/.test(call.path)));
+  }
+});
+
+test("Cloudflare authentication, scope, identity, network and response failures are provider-specific and never call Resend", async () => {
+  const cases = [
+    [new ProviderRejectedError(401), "cloudflare-auth-failed"],
+    [new ProviderRejectedError(403), "cloudflare-scope-failed"],
+    [new ProviderRejectedError(404), "cloudflare-resource-mismatch"],
+    [new ProviderTransportAmbiguousError("network-or-timeout"), "cloudflare-network-failure"],
+    [new Error("synthetic secret-bearing provider body"), "cloudflare-response-invalid"],
+  ];
+  for (const [providerError, expectedCode] of cases) {
+    const resend = resendFixture();
+    await assert.rejects(
+      runProviderCanary({
+        release: release(),
+        expectedRelease: release(),
+        expectedCloudflareAccountId: accountId,
+        expectedResendDomain: targetDomain,
+        cloudflareClient: { async request() { throw providerError; } },
+        resendClient: resend,
+      }),
+      (error) =>
+        error instanceof ProviderCanaryError &&
+        error.code === expectedCode &&
+        !error.message.includes("secret-bearing"),
+    );
+    assert.equal(resend.calls.length, 0);
+  }
+});
+
+test("Resend authentication, scope, identity, network and response failures are provider-specific after Cloudflare cleanup", async () => {
+  const cases = [
+    [
+      new ProviderRejectedError(401, { providerErrorCode: "invalid_api_key" }),
+      "resend-auth-failed",
+    ],
+    [
+      new ProviderRejectedError(403, { providerErrorCode: "restricted_api_key" }),
+      "resend-scope-failed",
+    ],
+    [new ProviderRejectedError(404), "resend-resource-mismatch"],
+    [new ProviderTransportAmbiguousError("network-or-timeout"), "resend-network-failure"],
+    [new Error("synthetic secret-bearing provider body"), "resend-response-invalid"],
+  ];
+  for (const [providerError, expectedCode] of cases) {
+    const cf = cloudflareFixture();
+    const resend = resendFixture({ error: providerError });
+    await assert.rejects(
+      runProviderCanary({
+        release: release(),
+        expectedRelease: release(),
+        expectedCloudflareAccountId: accountId,
+        expectedResendDomain: targetDomain,
+        cloudflareClient: cf.client,
+        resendClient: resend,
+      }),
+      (error) =>
+        error instanceof ProviderCanaryError &&
+        error.code === expectedCode &&
+        !error.message.includes("secret-bearing"),
+    );
+    assert.equal(resend.calls.length, 1);
+    assert.equal(resend.calls[0].method, "GET");
+    assert.equal(resend.calls[0].path, "/domains");
+    assert.equal(cf.state.database, null);
+    assert.equal(cf.state.worker, null);
+  }
 });
 
 test("wrong Cloudflare account identity fails before any disposable mutation", async () => {
@@ -518,7 +698,8 @@ test("substituted Worker annotations fail closed and are cleaned", async () => {
       resendClient: resendFixture(),
     }),
     (error) =>
-      error instanceof ProviderCanaryError && error.code === "worker-settings-substitution",
+      error instanceof ProviderCanaryError &&
+      error.code === "worker-version-detail-substitution",
   );
   assert.equal(cf.state.database, null);
   assert.equal(cf.state.worker, null);
@@ -594,11 +775,21 @@ test("release/controller/artifact substitution is rejected before provider acces
 
 test("ambiguous create results are reconciled exactly once without blind retry", async () => {
   const { cf, receipt } = await execute({
-    cloudflare: { ambiguousD1Create: true, ambiguousWorkerCreate: true },
+    cloudflare: {
+      ambiguousD1Create: true,
+      ambiguousWorkerContainerCreate: true,
+      ambiguousWorkerCreate: true,
+    },
   });
   assert.equal(validateProviderCanaryReceipt(receipt, release()), true);
   assert.equal(
     cf.state.calls.filter((call) => call.method === "POST" && call.path.endsWith("/d1/database")).length,
+    1,
+  );
+  assert.equal(
+    cf.state.calls.filter(
+      (call) => call.method === "POST" && call.path.endsWith("/workers/workers"),
+    ).length,
     1,
   );
   assert.equal(
@@ -621,7 +812,7 @@ test("ambiguous delete results pass only after authoritative absence is observed
     1,
   );
   assert.equal(
-    cf.state.calls.filter((call) => call.method === "DELETE" && call.path.includes("/workers/scripts/")).length,
+    cf.state.calls.filter((call) => call.method === "DELETE" && call.path.includes("/workers/workers/")).length,
     1,
   );
 });
