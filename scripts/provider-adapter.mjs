@@ -28,10 +28,48 @@ const providerConfiguration = Object.freeze({
       },
       { pattern: /^\/accounts\/[a-f0-9]{32}\/d1\/database\/[a-f0-9-]{36}$/, methods: ["GET", "DELETE"] },
       { pattern: /^\/accounts\/[a-f0-9]{32}\/d1\/database\/[a-f0-9-]{36}\/query$/, methods: ["POST"] },
+      {
+        pattern: /^\/accounts\/[a-f0-9]{32}\/workers\/workers$/,
+        methods: ["POST"],
+        validateBody({ body, bodyBytes }) {
+          if (bodyBytes !== undefined) {
+            throw new Error("Cloudflare disposable Worker body is invalid");
+          }
+          exactPlainObject(
+            body,
+            ["name", "subdomain", "tags"],
+            "Cloudflare disposable Worker body",
+          );
+          exactPlainObject(
+            body.subdomain,
+            ["enabled", "previews_enabled"],
+            "Cloudflare disposable Worker subdomain",
+          );
+          if (
+            !/^ft-provider-canary-[a-f0-9]{12}-[a-f0-9]{7}$/.test(body.name) ||
+            body.subdomain.enabled !== false ||
+            body.subdomain.previews_enabled !== false ||
+            !Array.isArray(body.tags) ||
+            body.tags.length !== 1 ||
+            body.tags[0] !== "fresh-towels-provider-canary"
+          ) {
+            throw new Error("Cloudflare disposable Worker body is outside the exact allowlist");
+          }
+        },
+      },
+      {
+        pattern:
+          /^\/accounts\/[a-f0-9]{32}\/workers\/workers\/(?:[a-f0-9]{32}|ft-provider-canary-[a-f0-9]{12}-[a-f0-9]{7})$/,
+        methods: ["GET", "DELETE"],
+      },
       { pattern: /^\/accounts\/[a-f0-9]{32}\/workers\/scripts\/[a-z0-9-]+$/, methods: ["DELETE"] },
       {
         pattern: /^\/accounts\/[a-f0-9]{32}\/workers\/scripts\/[a-z0-9-]+\/versions$/,
-        methods: ["GET", "POST"], list: true, queryShapes: [["page", "per_page"]],
+        methods: ["GET", "POST"],
+        list: true,
+        pagination: "cloudflare-worker-versions",
+        queryShapes: [["page", "per_page"]],
+        requiredQueryValues: Object.freeze({ page: "1", per_page: "100" }),
       },
       { pattern: /^\/accounts\/[a-f0-9]{32}\/workers\/scripts\/[a-z0-9-]+\/versions\/[a-f0-9-]{36}$/, methods: ["GET"] },
       {
@@ -206,6 +244,33 @@ function normalizedPagination(provider, endpoint, data) {
         Array.isArray(items) &&
         info.count === items.length &&
         info.count < info.per_page,
+    });
+  }
+  if (endpoint.pagination === "cloudflare-worker-versions") {
+    if (info !== null && info !== undefined) {
+      return Object.freeze({
+        complete:
+          typeof info === "object" &&
+          !Array.isArray(info) &&
+          info.page === 1 &&
+          info.per_page === 100 &&
+          Number.isSafeInteger(info.count) &&
+          info.count >= 0 &&
+          Number.isSafeInteger(info.total_count) &&
+          info.total_count === info.count &&
+          (!Object.hasOwn(info, "total_pages") || info.total_pages === 1) &&
+          Array.isArray(result?.items) &&
+          info.count === result.items.length &&
+          info.count < info.per_page,
+      });
+    }
+    return Object.freeze({
+      complete:
+        result !== null &&
+        typeof result === "object" &&
+        !Array.isArray(result) &&
+        Array.isArray(result.items) &&
+        result.items.length < 100,
     });
   }
   return Object.freeze({

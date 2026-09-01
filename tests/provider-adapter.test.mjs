@@ -173,6 +173,62 @@ test("Cloudflare adapter allows only the exact zone and Access application detai
   );
 });
 
+test("Cloudflare disposable Worker bootstrap is narrowly allowlisted and non-routable", async () => {
+  const calls = [];
+  const adapter = createCloudflareHttpAdapter({
+    token: "synthetic-cloudflare-token-value",
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({ success: true, result: {} });
+    },
+  });
+  const account = "a".repeat(32);
+  const name = "ft-provider-canary-aaaaaaaaaaaa-aaaaaaa";
+  const workerId = "b".repeat(32);
+  const body = {
+    name,
+    subdomain: { enabled: false, previews_enabled: false },
+    tags: ["fresh-towels-provider-canary"],
+  };
+  await adapter.request(
+    request(`/accounts/${account}/workers/workers`, {
+      method: "POST",
+      body,
+      idempotencyKey: "1".repeat(64),
+    }),
+  );
+  await adapter.request(request(`/accounts/${account}/workers/workers/${name}`));
+  await adapter.request(
+    request(`/accounts/${account}/workers/workers/${workerId}`, { method: "DELETE" }),
+  );
+  assert.deepEqual(
+    calls.map(({ url, options }) => [url, options.method]),
+    [
+      [`https://api.cloudflare.com/client/v4/accounts/${account}/workers/workers`, "POST"],
+      [`https://api.cloudflare.com/client/v4/accounts/${account}/workers/workers/${name}`, "GET"],
+      [`https://api.cloudflare.com/client/v4/accounts/${account}/workers/workers/${workerId}`, "DELETE"],
+    ],
+  );
+  for (const unsafeBody of [
+    { ...body, name: "fresh-towels-production" },
+    { ...body, subdomain: { enabled: true, previews_enabled: false } },
+    { ...body, subdomain: { enabled: false, previews_enabled: true } },
+    { ...body, tags: ["unexpected"] },
+    { ...body, routes: [] },
+  ]) {
+    await assert.rejects(
+      adapter.request(
+        request(`/accounts/${account}/workers/workers`, {
+          method: "POST",
+          body: unsafeBody,
+        }),
+      ),
+      /allowlist|unexpected/,
+    );
+  }
+  assert.equal(calls.length, 3);
+});
+
 test("HTTP adapter rejects arbitrary paths, queries, invalid bodies and unbound binary bytes pre-network", async () => {
   let calls = 0;
   const adapter = createCloudflareHttpAdapter({
@@ -292,6 +348,69 @@ test("list pagination is proven complete from provider-native envelopes and othe
   assert.equal(
     (await resendIncomplete.request(request("/domains", { query: { limit: "100" } }))).pagination.complete,
     false,
+  );
+});
+
+test("Cloudflare Worker versions prove bounded completeness without result_info", async () => {
+  const account = "a".repeat(32);
+  const path = `/accounts/${account}/workers/scripts/ft-provider-canary-aaaaaaaaaaaa-aaaaaaa/versions`;
+  const query = { page: "1", per_page: "100" };
+  const complete = createCloudflareHttpAdapter({
+    token: "synthetic-cloudflare-token-value",
+    fetchImpl: async () =>
+      jsonResponse({
+        success: true,
+        result: { items: [{ id: "11111111-1111-4111-8111-111111111111" }] },
+        result_info: null,
+      }),
+  });
+  const boundaryFull = createCloudflareHttpAdapter({
+    token: "synthetic-cloudflare-token-value",
+    fetchImpl: async () =>
+      jsonResponse({
+        success: true,
+        result: {
+          items: Array.from({ length: 100 }, (_, index) => ({ id: String(index) })),
+        },
+      }),
+  });
+  const completeWithProviderPagination = createCloudflareHttpAdapter({
+    token: "synthetic-cloudflare-token-value",
+    fetchImpl: async () =>
+      jsonResponse({
+        success: true,
+        result: { items: [{ id: "11111111-1111-4111-8111-111111111111" }] },
+        result_info: { count: 1, page: 1, per_page: 100, total_count: 1 },
+      }),
+  });
+  const contradictoryTotalPages = createCloudflareHttpAdapter({
+    token: "synthetic-cloudflare-token-value",
+    fetchImpl: async () =>
+      jsonResponse({
+        success: true,
+        result: { items: [{ id: "11111111-1111-4111-8111-111111111111" }] },
+        result_info: {
+          count: 1,
+          page: 1,
+          per_page: 100,
+          total_count: 1,
+          total_pages: 2,
+        },
+      }),
+  });
+  assert.equal((await complete.request(request(path, { query }))).pagination.complete, true);
+  assert.equal(
+    (await completeWithProviderPagination.request(request(path, { query }))).pagination.complete,
+    true,
+  );
+  assert.equal(
+    (await contradictoryTotalPages.request(request(path, { query }))).pagination.complete,
+    false,
+  );
+  assert.equal((await boundaryFull.request(request(path, { query }))).pagination.complete, false);
+  await assert.rejects(
+    complete.request(request(path, { query: { page: "1", per_page: "99" } })),
+    /page boundary/,
   );
 });
 
