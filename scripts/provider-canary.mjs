@@ -520,7 +520,10 @@ async function getWorkerIdentityForCleanup(client, accountId, expectedName) {
   if (
     !isPlainObject(response.result) ||
     !workerIdPattern.test(response.result.id ?? "") ||
-    response.result.name !== expectedName
+    response.result.name !== expectedName ||
+    !Array.isArray(response.result.tags) ||
+    response.result.tags.length !== 1 ||
+    response.result.tags[0] !== "fresh-towels-provider-canary"
   ) {
     fail("worker-cleanup-identity-untrusted");
   }
@@ -1101,6 +1104,12 @@ export async function runProviderCanary({
       } catch (error) {
         cleanupError ??= error;
       }
+    }
+    if (
+      cleanupError instanceof ProviderCanaryError &&
+      cleanupError.code === "worker-cleanup-identity-untrusted"
+    ) {
+      throw cleanupError;
     }
     if (cleanupError !== null) fail("disposable-cleanup-not-proven");
   }

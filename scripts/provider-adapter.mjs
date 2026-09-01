@@ -258,6 +258,7 @@ function normalizedPagination(provider, endpoint, data) {
           info.count >= 0 &&
           Number.isSafeInteger(info.total_count) &&
           info.total_count === info.count &&
+          (!Object.hasOwn(info, "total_pages") || info.total_pages === 1) &&
           Array.isArray(result?.items) &&
           info.count === result.items.length &&
           info.count < info.per_page,

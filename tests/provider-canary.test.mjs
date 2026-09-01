@@ -487,16 +487,32 @@ test("bounded provider canary verifies account, creates/queries/deletes EU D1, v
   );
   assert.ok(workerContainerCreateIndex >= 0);
   assert.ok(workerVersionCreateIndex > workerContainerCreateIndex);
-  assert.deepEqual(cf.state.calls[workerContainerCreateIndex].body, {
+  const workerContainerBody = {
     name: deriveProviderCanaryResourceName(release()),
     subdomain: { enabled: false, previews_enabled: false },
     tags: ["fresh-towels-provider-canary"],
-  });
+  };
+  const workerContainerRequest = cf.state.calls[workerContainerCreateIndex];
+  assert.deepEqual(workerContainerRequest.body, workerContainerBody);
+  assert.equal(
+    workerContainerRequest.bodySha256,
+    sha256(Buffer.from(`${canonicalJson(workerContainerBody)}\n`)),
+  );
+  assert.match(workerContainerRequest.idempotencyKey, /^[a-f0-9]{64}$/);
   assert.ok(cf.state.calls.some((call) => call.method === "POST" && call.path.endsWith("/versions")));
   const workerUpload = cf.state.calls.find(
     (call) => call.method === "POST" && call.path.endsWith("/versions"),
   );
   const workerUploadText = Buffer.from(workerUpload.bodyBytes).toString("utf8");
+  assert.notEqual(
+    providerEtag,
+    sha256(
+      Buffer.from(
+        'export default { fetch() { return new Response("provider-canary"); } };\n',
+        "utf8",
+      ),
+    ),
+  );
   assert.ok(workerUploadText.includes('"workers/message"'));
   assert.ok(workerUploadText.includes('"workers/tag"'));
   assert.ok(!workerUploadText.includes("workers/commit_sha"));
@@ -522,10 +538,8 @@ test("Cloudflare version upload cannot create a missing Worker parent", async ()
   assert.equal(cf.state.worker, null);
 });
 
-test("Worker parent identity, deployment and subdomain drift fail closed and are cleaned", async () => {
+test("Worker parent deployment and subdomain drift fail closed and are cleaned", async () => {
   for (const cloudflare of [
-    { substituteWorkerContainerName: true },
-    { substituteWorkerTags: true },
     { workerContainerDeployed: true },
     { workerSubdomainEnabled: true },
     { workerPreviewsEnabled: true },
@@ -542,10 +556,59 @@ test("Worker parent identity, deployment and subdomain drift fail closed and are
       }),
       (error) =>
         error instanceof ProviderCanaryError &&
-        ["worker-container-substitution", "disposable-cleanup-not-proven"].includes(error.code),
+        error.code === "worker-container-substitution",
     );
+    assert.equal(cf.state.database, null);
+    assert.equal(cf.state.worker, null);
     assert.ok(!cf.state.calls.some((call) => /dns_records|workers\/routes|deployments/.test(call.path)));
   }
+});
+
+test("untrusted Worker name or tag is never deleted during ambiguous cleanup", async () => {
+  for (const cloudflare of [
+    { substituteWorkerContainerName: true },
+    { substituteWorkerTags: true },
+  ]) {
+    const cf = cloudflareFixture(cloudflare);
+    await assert.rejects(
+      runProviderCanary({
+        release: release(),
+        expectedRelease: release(),
+        expectedCloudflareAccountId: accountId,
+        expectedResendDomain: targetDomain,
+        cloudflareClient: cf.client,
+        resendClient: resendFixture(),
+      }),
+      (error) =>
+        error instanceof ProviderCanaryError &&
+        error.code === "worker-cleanup-identity-untrusted",
+    );
+    assert.equal(cf.state.database, null);
+    assert.notEqual(cf.state.worker, null);
+    assert.ok(
+      !cf.state.calls.some(
+        (call) => call.method === "DELETE" && call.path.includes("/workers/workers/"),
+      ),
+    );
+  }
+});
+
+test("substituted Worker immutable ID cannot authorize deletion of the observed resource", async () => {
+  const cf = cloudflareFixture({ substituteWorkerContainerId: true });
+  await assert.rejects(
+    runProviderCanary({
+      release: release(),
+      expectedRelease: release(),
+      expectedCloudflareAccountId: accountId,
+      expectedResendDomain: targetDomain,
+      cloudflareClient: cf.client,
+      resendClient: resendFixture(),
+    }),
+    (error) =>
+      error instanceof ProviderCanaryError && error.code === "disposable-cleanup-not-proven",
+  );
+  assert.equal(cf.state.database, null);
+  assert.notEqual(cf.state.worker, null);
 });
 
 test("Cloudflare authentication, scope, identity, network and response failures are provider-specific and never call Resend", async () => {
@@ -648,7 +711,7 @@ test("incomplete D1 pagination fails before any disposable mutation", async () =
   assert.equal(cf.state.worker, null);
 });
 
-test("substituted Worker bytes fail the exact script hash and are cleaned", async () => {
+test("provider ETag drift between create and detail fails closed and is cleaned", async () => {
   const cf = cloudflareFixture({ substituteWorkerContent: true });
   await assert.rejects(
     runProviderCanary({
@@ -866,6 +929,28 @@ test("a pre-existing same-name resource is treated as an ambiguous prior executi
   );
   assert.equal(cf.state.database.name, name);
   assert.ok(!cf.state.calls.some((call) => call.method === "DELETE"));
+});
+
+test("a pre-existing zero-version Worker is never adopted, mutated, or deleted", async () => {
+  const name = deriveProviderCanaryResourceName(release());
+  const cf = cloudflareFixture({ preexistingWorker: name });
+  const resend = resendFixture();
+  await assert.rejects(
+    runProviderCanary({
+      release: release(),
+      expectedRelease: release(),
+      expectedCloudflareAccountId: accountId,
+      expectedResendDomain: targetDomain,
+      cloudflareClient: cf.client,
+      resendClient: resend,
+    }),
+    (error) =>
+      error instanceof ProviderCanaryError && error.code === "worker-previous-execution-ambiguous",
+  );
+  assert.equal(cf.state.worker.name, name);
+  assert.equal(cf.state.worker.versionId, null);
+  assert.equal(resend.calls.length, 0);
+  assert.ok(!cf.state.calls.some((call) => ["POST", "DELETE"].includes(call.method)));
 });
 
 test("cleanup failure overrides success and fails the canary closed", async () => {

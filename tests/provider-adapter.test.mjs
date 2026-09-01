@@ -383,10 +383,29 @@ test("Cloudflare Worker versions prove bounded completeness without result_info"
         result_info: { count: 1, page: 1, per_page: 100, total_count: 1 },
       }),
   });
+  const contradictoryTotalPages = createCloudflareHttpAdapter({
+    token: "synthetic-cloudflare-token-value",
+    fetchImpl: async () =>
+      jsonResponse({
+        success: true,
+        result: { items: [{ id: "11111111-1111-4111-8111-111111111111" }] },
+        result_info: {
+          count: 1,
+          page: 1,
+          per_page: 100,
+          total_count: 1,
+          total_pages: 2,
+        },
+      }),
+  });
   assert.equal((await complete.request(request(path, { query }))).pagination.complete, true);
   assert.equal(
     (await completeWithProviderPagination.request(request(path, { query }))).pagination.complete,
     true,
+  );
+  assert.equal(
+    (await contradictoryTotalPages.request(request(path, { query }))).pagination.complete,
+    false,
   );
   assert.equal((await boundaryFull.request(request(path, { query }))).pagination.complete, false);
   await assert.rejects(
