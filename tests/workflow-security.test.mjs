@@ -30,9 +30,11 @@ test('public pull requests cannot enter the dispatch or secret-bearing workflows
   );
   assert.doesNotMatch(packageWorkflow, /pull_request_target/);
   assert.doesNotMatch(executeWorkflow, /pull_request_target|pull_request:/);
-  assert.match(executeWorkflow, /environment:\s+production/);
+  assert.match(executeWorkflow, /environment:\s*\n\s+name:.*'canary'.*'production'/);
   assert.match(executeWorkflow, /PROTECTED_EXECUTOR_CANARY_NOT_YET_PROVEN/);
   assert.doesNotMatch(packageWorkflow, /secrets:\s+inherit/);
+  assert.match(packageWorkflow, /operation:\s*\{ required: true, type: string \}/);
+  assert.match(packageWorkflow, /\^\(canary\|production-release\)\$/);
   assert.doesNotMatch(packageWorkflow, /REQUESTER_APP_TOKEN|GITHUB_APP_PRIVATE_KEY/);
   assert.doesNotMatch(packageWorkflow, /manifest\.json packaging-oidc\.jwt payload\.bin/);
   assert.match(packageWorkflow, /manifest\.json payload\.bin/);
@@ -49,4 +51,16 @@ test('packaging keeps plaintext private and uploads only encrypted bytes', async
   assert.match(source, /publish-private-transport\.mjs/);
   assert.match(source, /immutable private Release/);
   assert.match(source, /dispatch-controller\.mjs/);
+});
+
+test('canary uses a reviewed environment, verifies transport and performs no provider mutation', async () => {
+  const source = await readFile(
+    new URL('../.github/workflows/execute-release.yml', import.meta.url),
+    'utf8',
+  );
+  assert.match(source, /needs\.intake\.outputs\.operation == 'canary'/);
+  assert.match(source, /create-canary-receipt\.mjs/);
+  assert.match(source, /EXECUTION_OUTCOME:\s+canary_verified/);
+  assert.match(source, /PROTECTED_EXECUTOR_CANARY_NOT_YET_PROVEN/);
+  assert.doesNotMatch(source, /wrangler\s+(?:deploy|publish)/);
 });

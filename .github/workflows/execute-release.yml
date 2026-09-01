@@ -14,7 +14,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: deployment-control-production
+  group: deployment-control-release
   cancel-in-progress: false
 
 jobs:
@@ -52,12 +52,12 @@ jobs:
           "$GITHUB_OUTPUT"
       - run: npm run check
 
-  production:
+  protected-execution:
     needs: intake
-    if: needs.intake.outputs.operation == 'production-release'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    environment: production
+    environment:
+      name: ${{ needs.intake.outputs.operation == 'canary' && 'canary' || 'production' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -75,9 +75,29 @@ jobs:
         env:
           EXPECTED_REVIEWER_ACTOR_ID: ${{ vars.EXPECTED_REVIEWER_ACTOR_ID }}
           GITHUB_TOKEN: ${{ github.token }}
-          PROTECTED_ENVIRONMENT_NAME: production
+          PROTECTED_ENVIRONMENT_NAME: ${{ needs.intake.outputs.operation == 'canary' && 'canary' || 'production' }}
           REQUESTER_ACTOR_ID: ${{ github.actor_id }}
         run: node scripts/verify-approval.mjs
+      - name: Acquire protected-executor identity
+        shell: bash
+        env:
+          OIDC_AUDIENCE: deployment-control-executor-v1
+        run: |
+          set -euo pipefail
+          response="$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
+          RESPONSE="$response" node -e \
+            'const fs=require("fs");const d=JSON.parse(process.env.RESPONSE);if(typeof d.value!=="string"||d.value.length<100)process.exit(1);fs.writeFileSync(process.env.RUNNER_TEMP+"/executor-oidc.jwt",d.value,{mode:0o400,flag:"wx"})'
+          unset response
+      - name: Atomically claim this exact execution
+        env:
+          RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
+        run: >-
+          node scripts/dispatch-controller.mjs
+          controller-identity.json
+          "$RUNNER_TEMP/executor-oidc.jwt"
+          execute-claim
       - name: Fetch and decrypt exact approved private transport
         env:
           EXPECTED_CONTROLLER_REPOSITORY_ID: ${{ vars.EXPECTED_CONTROLLER_REPOSITORY_ID }}
@@ -85,10 +105,46 @@ jobs:
           PRIVATE_TRANSPORT_DEPLOY_KEY: ${{ secrets.PRIVATE_TRANSPORT_DEPLOY_KEY }}
           PRIVATE_TRANSPORT_GIT_URL: ${{ secrets.PRIVATE_TRANSPORT_GIT_URL }}
           RELEASE_DECRYPTION_PRIVATE_KEY: ${{ secrets.RELEASE_DECRYPTION_PRIVATE_KEY }}
+          RELEASE_DECRYPTION_PASSPHRASE: ${{ secrets.RELEASE_DECRYPTION_PASSPHRASE }}
           RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
           VERIFIED_PAYLOAD_OUTPUT_DIRECTORY: ${{ runner.temp }}/verified-release
         run: node scripts/protected-transport.mjs
+      - name: Prepare hash-only canary receipt
+        if: needs.intake.outputs.operation == 'canary'
+        id: canary-receipt
+        env:
+          RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
+        run: node scripts/create-canary-receipt.mjs
+      - name: Acquire canary-finish identity
+        if: needs.intake.outputs.operation == 'canary'
+        shell: bash
+        env:
+          OIDC_AUDIENCE: deployment-control-executor-v1
+        run: |
+          set -euo pipefail
+          response="$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
+          RESPONSE="$response" node -e \
+            'const fs=require("fs");const d=JSON.parse(process.env.RESPONSE);if(typeof d.value!=="string"||d.value.length<100)process.exit(1);fs.writeFileSync(process.env.RUNNER_TEMP+"/executor-finish-oidc.jwt",d.value,{mode:0o400,flag:"wx"})'
+          unset response
+      - name: Record successful no-mutation canary
+        if: needs.intake.outputs.operation == 'canary'
+        env:
+          EXECUTION_OUTCOME: canary_verified
+          PROVIDER_RECEIPT_SHA256: ${{ steps.canary-receipt.outputs.receipt_sha256 }}
+          RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
+        run: >-
+          node scripts/dispatch-controller.mjs
+          controller-identity.json
+          "$RUNNER_TEMP/executor-finish-oidc.jwt"
+          execute-finish
       - name: Fail closed until remote canary and executor adapter are proven
+        if: needs.intake.outputs.operation == 'production-release'
         run: |
           echo "::error::PROTECTED_EXECUTOR_CANARY_NOT_YET_PROVEN"
           exit 78
+      - name: Remove protected executor material
+        if: always()
+        shell: bash
+        run: rm -rf "$RUNNER_TEMP/executor-oidc.jwt" "$RUNNER_TEMP/executor-finish-oidc.jwt" "$RUNNER_TEMP/verified-release"

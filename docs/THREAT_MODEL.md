@@ -8,29 +8,40 @@ authorize or perform a production deployment.
 A production mutation is permitted only when all of these statements are
 true:
 
-1. A protected controller revision validates a short-lived request from the
-   one configured GitHub App identity.
+1. An external dispatcher validates GitHub-signed OIDC claims from the exact
+   reusable controller workflow, atomically consumes the request in D1, and
+   dispatches through one public-repository-only GitHub App installation.
 2. The request names an immutable private-source repository ID and an exact
    40-character commit SHA. Names, branches and tags are never sufficient.
 3. The approved release binds the controller SHA, plaintext artifact digest,
-   ciphertext digest, release-evidence digest and exact private Release/asset
-   numeric IDs.
+   ciphertext digest, release-evidence digest, private Release ID, exact tag,
+   parentless transport commit and the two expected Git blob IDs.
 4. Build/intake code receives no production credential. The protected deploy
    job receives credentials only after GitHub Environment approval.
 5. The deploy job checks out only the protected controller. It never checks
    out or executes private application source, artifact scripts or request
    content.
-6. The deploy job downloads one encrypted asset from an immutable private
-   GitHub Release by exact release/asset IDs, verifies its
-   ciphertext digest, decrypts it in a fresh runner, verifies its plaintext
-   digest, and executes only an allowlisted controller operation.
+6. The deploy job uses a read-only SSH deploy key to fetch only the exact tag
+   into an empty bare repository. It requires a parentless commit whose tree is
+   exactly `manifest.json` plus `release.gpg`, verifies every bound digest,
+   decrypts offline, parses a fixed two-file tar allowlist and never checks out
+   or executes private source.
 7. The deployment initiator and required human reviewer are distinct. GitHub
    must prevent self-review and administrator bypass for the environment.
-8. The authoritative provider result is reconciled to an immutable version
-   identifier. A signed, hash-bound evidence record is stored outside both
-   repositories with retention protection before the next mutation.
-9. An interrupted or ambiguous remote operation fails closed and requires
+8. After Environment approval, a second GitHub OIDC identity atomically moves
+   the consumed request from `dispatched` to `executing`. A rerun, duplicate,
+   self-review or changed controller cannot obtain a second execution claim.
+9. The authoritative provider result is reconciled to an immutable version
+   identifier. Its sanitized digest and terminal state are retained outside
+   both repositories before another mutation is allowed.
+10. An interrupted or ambiguous remote operation fails closed and requires
    reconciliation; it is never retried blindly.
+
+The `canary` operation crosses the same approval, identity, replay and private
+transport boundaries as production, then records a hash-only
+`canary_verified` receipt without invoking any provider mutation. The
+`production-release` operation cannot mutate a provider until the fixed
+controller-owned adapter is added after that remote proof.
 
 Branch protection, required checks and a protected Environment are controls
 used to enforce the invariant. They are not substitutes for exact-SHA,
@@ -41,27 +52,28 @@ artifact-digest, credential-isolation or external-evidence checks.
 | Boundary | Trusted | Treated as hostile |
 | --- | --- | --- |
 | Public repository | Protected `main` bytes and pinned workflow actions | forks, pull requests, issue text, dispatch payloads |
-| Release intake | configured GitHub App numeric actor ID and configured private repository numeric ID | repository names alone, users, mutable refs, stale requests |
+| Release intake | exact GitHub OIDC claims, configured numeric repository IDs, atomic D1 consumption | repository names alone, users, mutable refs, stale or replayed requests |
 | Artifact build | exact reviewed private commit, isolated runner, public encryption key | application code with respect to later production secrets |
-| Artifact transport | immutable private GitHub Release, encrypted asset, exact release/asset IDs and digest | release name alone, mutable/latest aliases, public assets |
+| Artifact transport | immutable private GitHub Release, exact orphan commit/tag/tree/blob identities, encrypted payload | release name alone, mutable/latest aliases, public artifacts |
 | Production executor | protected controller SHA, approved Environment, minimal provider credentials | decrypted artifact scripts, PR code, request-provided commands |
 | Evidence | canonical hashes plus independently retained signed record | workflow logs or a Markdown claim that a gate passed |
 
 ## Threats and controls
 
-- **Forged request:** require `repository_dispatch`, exact event type, configured
-  Bot actor ID, configured repository ID, a UUID request ID and a narrow UTC
-  validity window.
+- **Forged request:** verify GitHub's RS256 OIDC signature, issuer, audience,
+  source/controller repository IDs, exact workflow refs/SHAs, run identity,
+  event, ref, visibility and a narrow UTC validity window.
 - **Branch or tag substitution:** accept lowercase full commit SHAs only and
   bind both source and controller commits.
 - **Controller drift:** compare the contract controller SHA, event workflow
   SHA, checked-out `HEAD` and `GITHUB_SHA` immediately before execution.
-- **Artifact substitution:** bind private release and asset IDs, ciphertext SHA-256,
+- **Artifact substitution:** bind the private Release ID, tag, commit and blob IDs, ciphertext SHA-256,
   plaintext SHA-256, byte count, encryption-key fingerprint and evidence
   SHA-256; verify again after download and decryption.
-- **Approval replay:** request IDs and nonces are single-use; expiration is at
-  most 30 minutes after issuance; the protected run and public transparency
-  attestation record consumption.
+- **Approval replay:** D1 uniquely consumes hashed OIDC `jti`, request ID,
+  hashed nonce and canonical request digest before dispatch. Failure after the
+  claim is terminal/ambiguous and never retried. A second atomic claim after
+  Environment approval is required before execution.
 - **Self-approval or bypass:** requester is a GitHub App Bot; production
   Environment requires the owner reviewer, prevents self-review and disallows
   administrator bypass. An unapproved job receives no environment secret.
@@ -99,7 +111,10 @@ policy. Production remains blocked until read-back evidence proves:
 - a GitHub App dispatch from its numeric Bot identity and least-privilege
   installation permissions;
 - an unapproved/denied canary cannot read environment secrets;
-- an immutable private Release with one encrypted asset, exact ID/digest
-  retrieval and a public Sigstore transparency attestation of the approved
-  ciphertext/receipt;
+- an immutable private Release whose exact tag resolves to the approved
+  parentless commit and two allowed blobs;
+- dispatcher D1 uniqueness under concurrent replay and an ambiguous-failure
+  reconciliation drill;
+- protected executor OIDC and one-time execution-claim behavior;
+- a sanitized provider receipt retained outside both repositories;
 - every adversarial canary case fails before any provider mutation.

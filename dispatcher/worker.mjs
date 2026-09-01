@@ -1,5 +1,6 @@
 const githubIssuer = 'https://token.actions.githubusercontent.com';
 const githubAudience = 'deployment-control-packaging-v1';
+const executorAudience = 'deployment-control-executor-v1';
 const githubApi = 'https://api.github.com';
 const digestPattern = /^[a-f0-9]{64}$/;
 const shaPattern = /^[a-f0-9]{40}$/;
@@ -33,7 +34,9 @@ function decodeBase64Url(value) {
   }
   const padded = `${value.replaceAll('-', '+').replaceAll('_', '/')}${'='.repeat((4 - (value.length % 4)) % 4)}`;
   const binary = atob(padded);
-  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  if (encodeBase64Url(bytes) !== value) throw new Error('base64url input is not canonical');
+  return bytes;
 }
 
 function encodeBase64Url(bytes) {
@@ -45,6 +48,96 @@ function encodeBase64Url(bytes) {
 async function sha256Hex(bytes) {
   const digest = await crypto.subtle.digest('SHA-256', bytes);
   return [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, '0')).join('');
+}
+
+function d1(environment) {
+  if (!environment.DISPATCH_STATE || typeof environment.DISPATCH_STATE.prepare !== 'function') {
+    throw new Error('dispatch state binding is unavailable');
+  }
+  return environment.DISPATCH_STATE;
+}
+
+function changedExactlyOnce(result) {
+  return result?.success === true && Number(result.meta?.changes) === 1;
+}
+
+export async function claimDispatch(request, claims, requestDigest, environment, now) {
+  const result = await d1(environment)
+    .prepare(`INSERT INTO dispatch_consumptions (
+      request_id, oidc_jti_sha256, nonce_sha256, request_sha256,
+      source_repository_id, source_commit_sha, controller_commit_sha,
+      source_workflow_run_id, source_workflow_run_attempt,
+      state, dispatch_http_status, claimed_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', NULL, ?, ?)`)
+    .bind(
+      request.requestId,
+      await sha256Hex(new TextEncoder().encode(claims.jti)),
+      await sha256Hex(new TextEncoder().encode(request.nonce)),
+      requestDigest,
+      request.source.repositoryId,
+      request.source.commitSha,
+      request.controller.commitSha,
+      request.source.workflowRunId,
+      request.source.workflowRunAttempt,
+      now,
+      now,
+    )
+    .run();
+  if (!changedExactlyOnce(result)) throw new Error('dispatch claim was not created');
+}
+
+export async function finishDispatch(requestId, state, status, environment, now) {
+  if (!['dispatched', 'ambiguous'].includes(state)) throw new Error('dispatch terminal state is invalid');
+  const result = await d1(environment)
+    .prepare(`UPDATE dispatch_consumptions
+      SET state = ?, dispatch_http_status = ?, updated_at = ?
+      WHERE request_id = ? AND state = 'claimed'`)
+    .bind(state, status, now, requestId)
+    .run();
+  if (!changedExactlyOnce(result)) throw new Error('dispatch terminal state was not recorded');
+}
+
+export async function claimExecution(request, claims, requestDigest, environment, now) {
+  const result = await d1(environment)
+    .prepare(`UPDATE dispatch_consumptions
+      SET state = 'executing', executor_jti_sha256 = ?,
+          controller_workflow_run_id = ?, controller_workflow_run_attempt = ?,
+          updated_at = ?
+      WHERE request_id = ? AND request_sha256 = ? AND state = 'dispatched'`)
+    .bind(
+      await sha256Hex(new TextEncoder().encode(claims.jti)),
+      claims.run_id,
+      Number(claims.run_attempt),
+      now,
+      request.requestId,
+      requestDigest,
+    )
+    .run();
+  if (!changedExactlyOnce(result)) throw new Error('execution claim was not created');
+}
+
+export async function finishExecution(request, claims, requestDigest, outcome, receiptDigest, environment, now) {
+  const expectedOutcomes = request.operation === 'canary'
+    ? ['canary_verified', 'execution_ambiguous']
+    : ['executed', 'execution_ambiguous'];
+  if (!expectedOutcomes.includes(outcome)) throw new Error('execution outcome is invalid');
+  exactString(receiptDigest, digestPattern, 'execution receipt digest');
+  const result = await d1(environment)
+    .prepare(`UPDATE dispatch_consumptions
+      SET state = ?, execution_receipt_sha256 = ?, updated_at = ?
+      WHERE request_id = ? AND request_sha256 = ? AND state = 'executing'
+        AND controller_workflow_run_id = ? AND controller_workflow_run_attempt = ?`)
+    .bind(
+      outcome,
+      receiptDigest,
+      now,
+      request.requestId,
+      requestDigest,
+      claims.run_id,
+      Number(claims.run_attempt),
+    )
+    .run();
+  if (!changedExactlyOnce(result)) throw new Error('execution outcome was not recorded');
 }
 
 export function parseCanonicalRequest(encoded, now, env) {
@@ -134,6 +227,52 @@ export async function verifyGithubOidc(token, request, env, fetcher, now) {
   return claims;
 }
 
+export async function verifyExecutorOidc(token, request, env, fetcher, now) {
+  if (typeof token !== 'string' || token.length < 100 || token.length > 16_384) throw new Error('executor OIDC token is malformed');
+  const parts = token.split('.');
+  if (parts.length !== 3) throw new Error('executor OIDC token is malformed');
+  const header = JSON.parse(new TextDecoder().decode(decodeBase64Url(parts[0])));
+  const claims = JSON.parse(new TextDecoder().decode(decodeBase64Url(parts[1])));
+  if (header.alg !== 'RS256' || header.typ !== 'JWT' || typeof header.kid !== 'string' || header.kid.length > 256) throw new Error('executor OIDC header is unsupported');
+  const discoveryResponse = await fetcher(`${githubIssuer}/.well-known/openid-configuration`);
+  if (!discoveryResponse.ok) throw new Error('executor OIDC discovery failed');
+  const discovery = await discoveryResponse.json();
+  if (discovery.issuer !== githubIssuer || discovery.jwks_uri !== `${githubIssuer}/.well-known/jwks`) throw new Error('executor OIDC discovery identity differs');
+  const jwksResponse = await fetcher(discovery.jwks_uri);
+  if (!jwksResponse.ok) throw new Error('executor OIDC signing keys unavailable');
+  const jwks = await jwksResponse.json();
+  const jwk = jwks.keys?.find((key) => key.kid === header.kid && key.kty === 'RSA' && key.alg === 'RS256' && key.use === 'sig');
+  if (!jwk) throw new Error('executor OIDC signing key differs');
+  const publicKey = await crypto.subtle.importKey('jwk', jwk, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+  if (!await crypto.subtle.verify('RSASSA-PKCS1-v1_5', publicKey, decodeBase64Url(parts[2]), new TextEncoder().encode(`${parts[0]}.${parts[1]}`))) throw new Error('executor OIDC signature is invalid');
+  const protectedEnvironment = request.operation === 'canary' ? 'canary' : 'production';
+  const expected = {
+    actor_id: env.REQUESTER_APP_ACTOR_ID,
+    aud: executorAudience,
+    environment: protectedEnvironment,
+    event_name: 'workflow_dispatch',
+    iss: githubIssuer,
+    ref: 'refs/heads/main',
+    ref_type: 'branch',
+    repository: env.CONTROLLER_REPOSITORY,
+    repository_id: request.controller.repositoryId,
+    repository_visibility: 'public',
+    run_attempt: '1',
+    runner_environment: 'github-hosted',
+    sha: request.controller.commitSha,
+    sub: `repo:${env.CONTROLLER_REPOSITORY}:environment:${protectedEnvironment}`,
+    workflow_ref: `${env.CONTROLLER_REPOSITORY}/.github/workflows/execute-release.yml@refs/heads/main`,
+    workflow_sha: request.controller.commitSha,
+  };
+  for (const [field, value] of Object.entries(expected)) {
+    if (String(claims[field] ?? '') !== String(value)) throw new Error(`executor OIDC claim ${field} differs`);
+  }
+  exactString(String(claims.run_id ?? ''), decimalPattern, 'executor run ID');
+  const seconds = Math.floor(now / 1000);
+  if (!Number.isInteger(claims.iat) || !Number.isInteger(claims.nbf) || !Number.isInteger(claims.exp) || claims.exp <= claims.iat || claims.exp - claims.iat > 10 * 60 || claims.iat > seconds + 60 || claims.nbf > seconds + 60 || claims.exp <= seconds || typeof claims.jti !== 'string' || claims.jti.length < 16 || claims.jti.length > 256) throw new Error('executor OIDC token time or identity is invalid');
+  return claims;
+}
+
 function derLength(length) {
   if (length < 128) return Uint8Array.of(length);
   const bytes = [];
@@ -188,10 +327,12 @@ async function dispatchWithPublicOnlyApp(encoded, env, fetcher, now) {
     body: JSON.stringify({ inputs: { release_request_base64: encoded }, ref: 'main' }),
   });
   if (dispatchResponse.status !== 204) throw new Error('controller workflow dispatch failed');
+  return dispatchResponse.status;
 }
 
 export async function handleDispatch(httpRequest, env, fetcher = fetch, now = Date.now()) {
-  if (httpRequest.method !== 'POST' || new URL(httpRequest.url).pathname !== '/v1/dispatch') return new Response('Not found', { status: 404 });
+  const path = new URL(httpRequest.url).pathname;
+  if (httpRequest.method !== 'POST' || !['/v1/dispatch', '/v1/execute-claim', '/v1/execute-finish'].includes(path)) return new Response('Not found', { status: 404 });
   try {
     const contentType = httpRequest.headers.get('content-type') ?? '';
     if (!contentType.toLowerCase().startsWith('application/json')) throw new Error('content type is invalid');
@@ -200,11 +341,46 @@ export async function handleDispatch(httpRequest, env, fetcher = fetch, now = Da
     const bodyText = await httpRequest.text();
     if (bodyText.length > 40_000) throw new Error('request body is too large');
     const body = JSON.parse(bodyText);
-    exactObject(body, ['releaseRequestBase64'], 'dispatch body');
+    exactObject(
+      body,
+      path === '/v1/execute-finish'
+        ? ['releaseRequestBase64', 'outcome', 'providerReceiptSha256']
+        : ['releaseRequestBase64'],
+      'dispatch body',
+    );
     const verified = parseCanonicalRequest(body.releaseRequestBase64, now, env);
-    await verifyGithubOidc(authorization.slice(7), verified.request, env, fetcher, now);
-    await dispatchWithPublicOnlyApp(body.releaseRequestBase64, env, fetcher, now);
-    return Response.json({ requestDigest: await sha256Hex(new TextEncoder().encode(verified.text)), requestId: verified.request.requestId }, { status: 202, headers: { 'cache-control': 'no-store' } });
+    const requestDigest = await sha256Hex(new TextEncoder().encode(verified.text));
+    if (path !== '/v1/dispatch') {
+      const claims = await verifyExecutorOidc(authorization.slice(7), verified.request, env, fetcher, now);
+      if (path === '/v1/execute-claim') {
+        await claimExecution(verified.request, claims, requestDigest, env, now);
+      } else {
+        await finishExecution(
+          verified.request,
+          claims,
+          requestDigest,
+          body.outcome,
+          body.providerReceiptSha256,
+          env,
+          now,
+        );
+      }
+      return Response.json({ requestDigest, requestId: verified.request.requestId }, { status: 202, headers: { 'cache-control': 'no-store' } });
+    }
+    const claims = await verifyGithubOidc(authorization.slice(7), verified.request, env, fetcher, now);
+    await claimDispatch(verified.request, claims, requestDigest, env, now);
+    try {
+      const dispatchStatus = await dispatchWithPublicOnlyApp(body.releaseRequestBase64, env, fetcher, now);
+      await finishDispatch(verified.request.requestId, 'dispatched', dispatchStatus, env, now);
+    } catch (error) {
+      try {
+        await finishDispatch(verified.request.requestId, 'ambiguous', 0, env, now);
+      } catch {
+        // The unique claim remains consumed. Reconciliation is required; never dispatch again.
+      }
+      throw error;
+    }
+    return Response.json({ requestDigest, requestId: verified.request.requestId }, { status: 202, headers: { 'cache-control': 'no-store' } });
   } catch {
     return Response.json({ error: 'dispatch_rejected' }, { status: 401, headers: { 'cache-control': 'no-store' } });
   }

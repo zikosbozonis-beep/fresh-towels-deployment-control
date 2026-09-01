@@ -15,6 +15,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   canonicalJson,
+  decodeCanonicalBase64Url,
   sha256,
   validateReleaseRequest,
 } from './control-contract.mjs';
@@ -257,6 +258,15 @@ async function decrypt(ciphertextPath, environment, root) {
   await mkdir(gpgHome, { mode: 0o700 });
   const privateKey = join(root, 'decryption-key.asc');
   const envelopePath = join(root, 'envelope.tar');
+  const passphrase = environment.RELEASE_DECRYPTION_PASSPHRASE;
+  if (
+    typeof passphrase !== 'string' ||
+    passphrase.length < 16 ||
+    passphrase.length > 1024 ||
+    /[\r\n\0]/.test(passphrase)
+  ) {
+    throw new Error('release decryption passphrase is unavailable or invalid');
+  }
   await writeFile(privateKey, required(environment, 'RELEASE_DECRYPTION_PRIVATE_KEY'), {
     flag: 'wx',
     mode: 0o600,
@@ -284,12 +294,21 @@ async function decrypt(ciphertextPath, environment, root) {
       '--no-auto-key-retrieve',
       '--auto-key-locate',
       'clear',
+      '--pinentry-mode',
+      'loopback',
+      '--passphrase-fd',
+      '0',
       '--output',
       envelopePath,
       '--decrypt',
       ciphertextPath,
     ],
-    { encoding: 'utf8', env: cleanEnvironment, windowsHide: true },
+    {
+      encoding: 'utf8',
+      env: cleanEnvironment,
+      input: `${passphrase}\n`,
+      windowsHide: true,
+    },
   );
   if (decryptResult.status !== 0) throw new Error('Offline GPG decryption failed');
   return envelopePath;
@@ -297,7 +316,9 @@ async function decrypt(ciphertextPath, environment, root) {
 
 export async function verifyProtectedTransport(environment = process.env) {
   const encoded = required(environment, 'RELEASE_REQUEST_BASE64', /^[A-Za-z0-9_-]{100,32768}$/);
-  const request = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+  const request = JSON.parse(
+    decodeCanonicalBase64Url(encoded, 'RELEASE_REQUEST_BASE64').toString('utf8'),
+  );
   validateReleaseRequest(request, {
     expectedControllerRepositoryId: required(
       environment,
@@ -349,7 +370,7 @@ export async function verifyProtectedTransport(environment = process.env) {
 
 if (process.argv[1]?.endsWith('protected-transport.mjs')) {
   verifyProtectedTransport().then(
-    (result) => process.stdout.write(`${JSON.stringify({ output: result.output })}\n`),
+    () => process.stdout.write('Protected transport verified.\n'),
     (error) => {
       console.error(`Protected transport rejected: ${error.message}`);
       process.exitCode = 1;

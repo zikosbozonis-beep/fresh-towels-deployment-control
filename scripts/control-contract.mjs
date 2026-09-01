@@ -94,6 +94,17 @@ export function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
+export function decodeCanonicalBase64Url(value, label = 'base64url input') {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/.test(value)) {
+    throw new Error(`${label} is invalid`);
+  }
+  const bytes = Buffer.from(value, 'base64url');
+  if (bytes.toString('base64url') !== value) {
+    throw new Error(`${label} is not canonical`);
+  }
+  return bytes;
+}
+
 export function validateReleaseRequest(request, options = {}) {
   assertExactKeys(request, topKeys, 'request');
   if (request.schema !== 'deployment-control/release-request/v1') {

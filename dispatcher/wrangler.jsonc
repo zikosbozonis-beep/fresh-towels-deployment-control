@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "fresh-towels-release-dispatcher",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "d1_databases": [
+    {
+      "binding": "DISPATCH_STATE",
+      "database_name": "fresh-towels-release-dispatch-state",
+      "database_id": "SET_DURING_PROVISIONING",
+      "migrations_dir": "migrations"
+    }
+  ]
+}
