@@ -250,6 +250,49 @@ function required(environment, name, pattern) {
   return value;
 }
 
+export function validateTransportBindings(environment) {
+  const rawDeployKey = required(environment, "PRIVATE_TRANSPORT_DEPLOY_KEY");
+  const normalizedDeployKey = rawDeployKey.replaceAll("\r\n", "\n");
+  const keyLabel = "OPENSSH";
+  const begin = `-----BEGIN ${keyLabel} PRIVATE KEY-----`;
+  const end = `-----END ${keyLabel} PRIVATE KEY-----`;
+  const lines = normalizedDeployKey.split("\n");
+  if (
+    normalizedDeployKey.includes("\r") ||
+    normalizedDeployKey.includes("\0") ||
+    lines.length < 4 ||
+    lines[0] !== begin ||
+    lines.at(-1) !== end ||
+    lines.slice(1, -1).some((line) => !/^[A-Za-z0-9+/]{4,}={0,2}$/.test(line))
+  ) {
+    throw new Error("Deploy key material is invalid");
+  }
+  const deployKey = `${normalizedDeployKey}\n`;
+  const expectedKeySha256 = required(
+    environment,
+    "PRIVATE_TRANSPORT_DEPLOY_KEY_SHA256",
+    digestPattern,
+  );
+  if (sha256(Buffer.from(deployKey)) !== expectedKeySha256) {
+    throw new Error("Deploy key secret binding differs");
+  }
+
+  const gitUrl = required(
+    environment,
+    "PRIVATE_TRANSPORT_GIT_URL",
+    /^git@github\.com:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\.git$/,
+  );
+  const expectedGitUrlSha256 = required(
+    environment,
+    "PRIVATE_TRANSPORT_GIT_URL_SHA256",
+    digestPattern,
+  );
+  if (sha256(Buffer.from(gitUrl)) !== expectedGitUrlSha256) {
+    throw new Error("Transport repository binding differs");
+  }
+  return { deployKey, gitUrl };
+}
+
 function runGit(repository, arguments_, options = {}) {
   const result = spawnSync("git", ["-C", repository, ...arguments_], {
     encoding: options.encoding ?? "utf8",
@@ -395,11 +438,12 @@ export function validateManifest(manifestBytes, request) {
 }
 
 async function fetchTransport(request, environment, root) {
+  const bindings = validateTransportBindings(environment);
   const repository = join(root, "transport.git");
   await mkdir(repository, { mode: 0o700 });
   const deployKey = join(root, "deploy-key");
   const sshWrapper = join(root, "ssh-wrapper");
-  await writeFile(deployKey, required(environment, "PRIVATE_TRANSPORT_DEPLOY_KEY"), {
+  await writeFile(deployKey, bindings.deployKey, {
     flag: "wx",
     mode: 0o600,
   });
@@ -420,11 +464,7 @@ async function fetchTransport(request, environment, root) {
       "fetch",
       "--depth=1",
       "--no-tags",
-      required(
-        environment,
-        "PRIVATE_TRANSPORT_GIT_URL",
-        /^git@github\.com:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\.git$/,
-      ),
+      bindings.gitUrl,
       `refs/tags/${request.artifact.transportTag}:refs/tags/release`,
     ],
     { environment: gitEnvironment },
