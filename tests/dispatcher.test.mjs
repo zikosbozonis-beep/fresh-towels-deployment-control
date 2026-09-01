@@ -13,11 +13,13 @@ const env = {
   CONTROLLER_COMMIT_SHA: controllerSha,
   CONTROLLER_REPOSITORY: "owner/control",
   CONTROLLER_REPOSITORY_ID: "2002",
+  CONTROLLER_REPOSITORY_OWNER_ID: "9009",
   GITHUB_APP_ID: "3003",
   GITHUB_APP_INSTALLATION_ID: "4004",
   REQUESTER_APP_ACTOR_ID: "7007",
   SOURCE_REPOSITORY: "owner/private-app",
   SOURCE_REPOSITORY_ID: "1001",
+  SOURCE_REPOSITORY_OWNER_ID: "9009",
   SOURCE_WORKFLOW_PATH: ".github/workflows/release-handoff.yml",
 };
 
@@ -185,12 +187,13 @@ function oidcClaims(overrides = {}) {
     ref_type: "branch",
     repository: "owner/private-app",
     repository_id: "1001",
+    repository_owner_id: "9009",
     repository_visibility: "private",
     run_attempt: "1",
     run_id: "5005",
     runner_environment: "github-hosted",
     sha: sourceSha,
-    sub: "repo:owner/private-app:ref:refs/heads/main",
+    sub: "repo:owner@9009/private-app@1001:ref:refs/heads/main",
     workflow_ref: "owner/private-app/.github/workflows/release-handoff.yml@refs/heads/main",
     workflow_sha: sourceSha,
     ...overrides,
@@ -335,6 +338,16 @@ test("altered caller identity and altered signatures fail before App token issua
   assert.equal(tampered.calls.length, 2);
 });
 
+test("legacy mutable OIDC subjects fail before App token issuance", async () => {
+  const value = await fixture({ sub: "repo:owner/private-app:ref:refs/heads/main" });
+  assert.equal(
+    (await handleDispatch(value.httpRequest, value.applicationEnvironment, value.fetcher, now))
+      .status,
+    401,
+  );
+  assert.equal(value.calls.length, 2);
+});
+
 test("stale evidence and unexpected public input fail without network activity", async () => {
   const value = await fixture();
   const stale = await handleDispatch(
@@ -411,12 +424,13 @@ function executorClaims(overrides = {}) {
     ref_type: "branch",
     repository: "owner/control",
     repository_id: "2002",
+    repository_owner_id: "9009",
     repository_visibility: "public",
     run_attempt: "1",
     run_id: "8008",
     runner_environment: "github-hosted",
     sha: controllerSha,
-    sub: "repo:owner/control:environment:production",
+    sub: "repo:owner@9009/control@2002:environment:production",
     workflow_ref: "owner/control/.github/workflows/execute-release.yml@refs/heads/main",
     workflow_sha: controllerSha,
     ...overrides,
@@ -575,7 +589,7 @@ test("canary executor identity is bound to the reviewed canary environment", asy
     value.oidcKeys.privateKey,
     executorClaims({
       environment: "canary",
-      sub: "repo:owner/control:environment:canary",
+      sub: "repo:owner@9009/control@2002:environment:canary",
     }),
   );
   const request = new Request("https://dispatcher.example/v1/execute-claim", {
