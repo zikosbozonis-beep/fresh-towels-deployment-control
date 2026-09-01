@@ -40,6 +40,19 @@ function exactString(value, pattern, label) {
   return value;
 }
 
+function immutableRepositorySubject(repository, ownerId, repositoryId, context) {
+  exactString(repository, /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, "OIDC repository");
+  exactString(ownerId, decimalPattern, "OIDC repository owner ID");
+  exactString(repositoryId, decimalPattern, "OIDC repository ID");
+  exactString(
+    context,
+    /^(?:ref:refs\/heads\/main|environment:(?:canary|production))$/,
+    "OIDC context",
+  );
+  const [owner, name] = repository.split("/");
+  return `repo:${owner}@${ownerId}/${name}@${repositoryId}:${context}`;
+}
+
 function canonicalJson(value) {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -340,12 +353,18 @@ export async function verifyGithubOidc(token, request, env, fetcher, now) {
     ref_type: "branch",
     repository: env.SOURCE_REPOSITORY,
     repository_id: request.source.repositoryId,
+    repository_owner_id: env.SOURCE_REPOSITORY_OWNER_ID,
     repository_visibility: "private",
     run_attempt: String(request.source.workflowRunAttempt),
     run_id: request.source.workflowRunId,
     runner_environment: "github-hosted",
     sha: request.source.commitSha,
-    sub: `repo:${env.SOURCE_REPOSITORY}:ref:refs/heads/main`,
+    sub: immutableRepositorySubject(
+      env.SOURCE_REPOSITORY,
+      env.SOURCE_REPOSITORY_OWNER_ID,
+      request.source.repositoryId,
+      "ref:refs/heads/main",
+    ),
     workflow_ref: `${env.SOURCE_REPOSITORY}/${env.SOURCE_WORKFLOW_PATH}@refs/heads/main`,
     workflow_sha: request.source.commitSha,
   };
@@ -428,11 +447,17 @@ export async function verifyExecutorOidc(token, request, env, fetcher, now) {
     ref_type: "branch",
     repository: env.CONTROLLER_REPOSITORY,
     repository_id: request.controller.repositoryId,
+    repository_owner_id: env.CONTROLLER_REPOSITORY_OWNER_ID,
     repository_visibility: "public",
     run_attempt: "1",
     runner_environment: "github-hosted",
     sha: request.controller.commitSha,
-    sub: `repo:${env.CONTROLLER_REPOSITORY}:environment:${protectedEnvironment}`,
+    sub: immutableRepositorySubject(
+      env.CONTROLLER_REPOSITORY,
+      env.CONTROLLER_REPOSITORY_OWNER_ID,
+      request.controller.repositoryId,
+      `environment:${protectedEnvironment}`,
+    ),
     workflow_ref: `${env.CONTROLLER_REPOSITORY}/.github/workflows/execute-release.yml@refs/heads/main`,
     workflow_sha: request.controller.commitSha,
   };
