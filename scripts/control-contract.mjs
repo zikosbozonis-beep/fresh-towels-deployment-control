@@ -112,7 +112,16 @@ export function validateReleaseRequest(request, options = {}) {
   }
   assertString(request.requestId, uuidV4Pattern, 'requestId');
   assertString(request.nonce, noncePattern, 'nonce');
-  if (!['canary', 'production-release'].includes(request.operation)) {
+  if (
+    ![
+      'canary',
+      'provider-canary',
+      'production-dns-stage',
+      'production-bootstrap',
+      'production-release',
+      'production-cutover',
+    ].includes(request.operation)
+  ) {
     throw new Error('operation is not allowlisted');
   }
 

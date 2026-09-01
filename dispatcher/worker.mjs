@@ -1,3 +1,9 @@
+import {
+  ciphertextCustodyBodyKeys,
+  ciphertextCustodyPaths,
+  handleCiphertextCustody,
+} from "./ciphertext-custody.mjs";
+
 const githubIssuer = "https://token.actions.githubusercontent.com";
 const githubAudience = "deployment-control-packaging-v1";
 const executorAudience = "deployment-control-executor-v1";
@@ -99,15 +105,17 @@ export async function claimDispatch(request, claims, requestDigest, environment,
   const result = await d1(environment)
     .prepare(`INSERT INTO dispatch_consumptions (
       request_id, oidc_jti_sha256, nonce_sha256, request_sha256,
+      operation,
       source_repository_id, source_commit_sha, controller_commit_sha,
       source_workflow_run_id, source_workflow_run_attempt,
       state, dispatch_http_status, claimed_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', NULL, ?, ?)`)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', NULL, ?, ?)`)
     .bind(
       request.requestId,
       await sha256Hex(new TextEncoder().encode(claims.jti)),
       await sha256Hex(new TextEncoder().encode(request.nonce)),
       requestDigest,
+      request.operation,
       request.source.repositoryId,
       request.source.commitSha,
       request.controller.commitSha,
@@ -118,6 +126,77 @@ export async function claimDispatch(request, claims, requestDigest, environment,
     )
     .run();
   if (!changedExactlyOnce(result)) throw new Error("dispatch claim was not created");
+}
+
+export async function verifyExecutionPrerequisite(
+  request,
+  claims,
+  requestDigest,
+  prerequisiteRequestId,
+  prerequisiteReceiptSha256,
+  prerequisiteRunId,
+  environment,
+  now,
+) {
+  const prerequisiteOperation = {
+    "production-dns-stage": "provider-canary",
+    "production-bootstrap": "production-dns-stage",
+    "production-release": "production-bootstrap",
+    "production-cutover": "production-release",
+  }[request.operation];
+  if (!prerequisiteOperation) throw new Error("operation has no execution prerequisite");
+  exactString(
+    prerequisiteRequestId,
+    /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/,
+    "prerequisite request ID",
+  );
+  exactString(
+    prerequisiteReceiptSha256,
+    digestPattern,
+    "prerequisite receipt digest",
+  );
+  exactString(prerequisiteRunId, decimalPattern, "prerequisite workflow run ID");
+  const earliestAccepted = now - 24 * 60 * 60 * 1000;
+  const result = await d1(environment)
+    .prepare(`UPDATE dispatch_consumptions
+      SET prerequisite_request_id = ?, prerequisite_receipt_sha256 = ?, updated_at = ?
+      WHERE request_id = ? AND request_sha256 = ? AND state = 'executing'
+        AND operation = ? AND controller_workflow_run_id = ?
+        AND controller_workflow_run_attempt = ?
+        AND prerequisite_request_id IS NULL
+        AND prerequisite_receipt_sha256 IS NULL
+        AND EXISTS (
+          SELECT 1 FROM dispatch_consumptions AS prerequisite
+          WHERE prerequisite.request_id = ?
+            AND prerequisite.operation = ?
+            AND prerequisite.state = 'executed'
+            AND prerequisite.source_repository_id = ?
+            AND prerequisite.source_commit_sha = ?
+            AND prerequisite.controller_commit_sha = ?
+            AND prerequisite.controller_workflow_run_id = ?
+            AND prerequisite.execution_receipt_sha256 = ?
+            AND prerequisite.updated_at >= ?
+        )`)
+    .bind(
+      prerequisiteRequestId,
+      prerequisiteReceiptSha256,
+      now,
+      request.requestId,
+      requestDigest,
+      request.operation,
+      claims.run_id,
+      Number(claims.run_attempt),
+      prerequisiteRequestId,
+      prerequisiteOperation,
+      request.source.repositoryId,
+      request.source.commitSha,
+      request.controller.commitSha,
+      prerequisiteRunId,
+      prerequisiteReceiptSha256,
+      earliestAccepted,
+    )
+    .run();
+  if (!changedExactlyOnce(result)) throw new Error("execution prerequisite is not proven");
 }
 
 export async function finishDispatch(requestId, state, status, environment, now) {
@@ -216,7 +295,16 @@ export function parseCanonicalRequest(encoded, now, env) {
     "requestId",
   );
   exactString(request.nonce, /^[A-Za-z0-9_-]{43}$/, "nonce");
-  if (!["canary", "production-release"].includes(request.operation))
+  if (
+    ![
+      "canary",
+      "provider-canary",
+      "production-dns-stage",
+      "production-bootstrap",
+      "production-release",
+      "production-cutover",
+    ].includes(request.operation)
+  )
     throw new Error("operation is not allowlisted");
   exactObject(
     request.source,
@@ -613,9 +701,16 @@ async function dispatchWithPublicOnlyApp(encoded, env, fetcher, now) {
 
 export async function handleDispatch(httpRequest, env, fetcher = fetch, now = Date.now()) {
   const path = new URL(httpRequest.url).pathname;
+  const custodyBodyKeys = ciphertextCustodyBodyKeys(path);
   if (
     httpRequest.method !== "POST" ||
-    !["/v1/dispatch", "/v1/execute-claim", "/v1/execute-finish"].includes(path)
+    ![
+      "/v1/dispatch",
+      "/v1/execute-claim",
+      "/v1/execute-finish",
+      "/v1/verify-prerequisite",
+      ...Object.values(ciphertextCustodyPaths),
+    ].includes(path)
   )
     return new Response("Not found", { status: 404 });
   try {
@@ -625,13 +720,22 @@ export async function handleDispatch(httpRequest, env, fetcher = fetch, now = Da
     const authorization = httpRequest.headers.get("authorization") ?? "";
     if (!authorization.startsWith("Bearer ")) throw new Error("OIDC authorization is absent");
     const bodyText = await httpRequest.text();
-    if (bodyText.length > 40_000) throw new Error("request body is too large");
+    if (bodyText.length > (custodyBodyKeys ? 131_072 : 40_000)) {
+      throw new Error("request body is too large");
+    }
     const body = JSON.parse(bodyText);
     exactObject(
       body,
-      path === "/v1/execute-finish"
+      custodyBodyKeys ?? (path === "/v1/execute-finish"
         ? ["releaseRequestBase64", "outcome", "providerReceiptSha256"]
-        : ["releaseRequestBase64"],
+        : path === "/v1/verify-prerequisite"
+          ? [
+              "releaseRequestBase64",
+              "prerequisiteRequestId",
+              "prerequisiteReceiptSha256",
+              "prerequisiteRunId",
+            ]
+          : ["releaseRequestBase64"]),
       "dispatch body",
     );
     const verified = parseCanonicalRequest(body.releaseRequestBase64, now, env);
@@ -644,8 +748,30 @@ export async function handleDispatch(httpRequest, env, fetcher = fetch, now = Da
         fetcher,
         now,
       );
-      if (path === "/v1/execute-claim") {
+      let protectedResult = null;
+      if (custodyBodyKeys) {
+        protectedResult = await handleCiphertextCustody({
+          body,
+          claims,
+          environment: env,
+          now,
+          path,
+          request: verified.request,
+          requestDigest,
+        });
+      } else if (path === "/v1/execute-claim") {
         await claimExecution(verified.request, claims, requestDigest, env, now);
+      } else if (path === "/v1/verify-prerequisite") {
+        await verifyExecutionPrerequisite(
+          verified.request,
+          claims,
+          requestDigest,
+          body.prerequisiteRequestId,
+          body.prerequisiteReceiptSha256,
+          body.prerequisiteRunId,
+          env,
+          now,
+        );
       } else {
         await finishExecution(
           verified.request,
@@ -658,7 +784,11 @@ export async function handleDispatch(httpRequest, env, fetcher = fetch, now = Da
         );
       }
       return Response.json(
-        { requestDigest, requestId: verified.request.requestId },
+        {
+          requestDigest,
+          requestId: verified.request.requestId,
+          ...(protectedResult ?? {}),
+        },
         { status: 202, headers: { "cache-control": "no-store" } },
       );
     }

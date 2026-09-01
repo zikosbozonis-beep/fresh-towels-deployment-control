@@ -22,7 +22,16 @@
     "nonce": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
     "issuedAt": { "type": "string", "format": "date-time" },
     "expiresAt": { "type": "string", "format": "date-time" },
-    "operation": { "enum": ["canary", "production-release"] },
+    "operation": {
+      "enum": [
+        "canary",
+        "provider-canary",
+        "production-dns-stage",
+        "production-bootstrap",
+        "production-release",
+        "production-cutover"
+      ]
+    },
     "source": {
       "type": "object",
       "additionalProperties": false,

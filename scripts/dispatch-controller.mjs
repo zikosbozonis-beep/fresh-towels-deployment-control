@@ -16,7 +16,15 @@ function required(name, pattern) {
 async function main() {
   const [identityPath, oidcPath, mode = 'dispatch'] = process.argv.slice(2);
   if (!identityPath || !oidcPath) throw new Error('identity and OIDC paths are required');
-  if (!['dispatch', 'execute-claim', 'execute-finish'].includes(mode)) throw new Error('dispatcher operation is invalid');
+  if (
+    ![
+      'dispatch',
+      'execute-claim',
+      'execute-finish',
+      'verify-prerequisite',
+    ].includes(mode)
+  )
+    throw new Error('dispatcher operation is invalid');
   const identity = JSON.parse(await readFile(resolve(identityPath), 'utf8'));
   if (
     identity.configured !== true ||
@@ -54,13 +62,31 @@ async function main() {
   const expectedReceipt = validateReleaseRequest(releaseRequest);
   const body = { releaseRequestBase64 };
   if (mode === 'execute-finish') {
-    body.outcome = required('EXECUTION_OUTCOME', /^(canary_verified|executed|execution_ambiguous)$/);
+    body.outcome = required(
+      'EXECUTION_OUTCOME',
+      /^(canary_verified|executed|execution_ambiguous)$/,
+    );
     body.providerReceiptSha256 = required('PROVIDER_RECEIPT_SHA256', /^[a-f0-9]{64}$/);
+  }
+  if (mode === 'verify-prerequisite') {
+    body.prerequisiteRequestId = required(
+      'PREREQUISITE_REQUEST_ID',
+      /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/,
+    );
+    body.prerequisiteReceiptSha256 = required(
+      'PREREQUISITE_RECEIPT_SHA256',
+      /^[a-f0-9]{64}$/,
+    );
+    body.prerequisiteRunId = required(
+      'PREREQUISITE_RUN_ID',
+      /^[1-9][0-9]{0,19}$/,
+    );
   }
   const endpoint = {
     dispatch: '/v1/dispatch',
     'execute-claim': '/v1/execute-claim',
     'execute-finish': '/v1/execute-finish',
+    'verify-prerequisite': '/v1/verify-prerequisite',
   }[mode];
   const response = await fetch(
     new URL(endpoint, origin),

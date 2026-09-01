@@ -18,15 +18,28 @@ The private caller receives no controller/App/production secret. It encrypts a
 fixed capsule with the public release key, publishes only `manifest.json` and
 `release.gpg` to an immutable private Release, then presents GitHub-signed OIDC
 evidence to the dispatcher. The protected executor fetches with a read-only
-deploy key only after independent approval. The provider adapter intentionally
-remains fail-closed until the non-production remote canary is proven.
+deploy key only after independent approval. The provider adapter is a fixed,
+least-privilege, exact-release-bound and fail-closed controller component.
 
-The reusable handoff requires an explicit `canary` or `production-release`
-operation. A canary still requires independent review, one-time OIDC/D1
-execution claiming, private transport fetch, decryption and digest validation,
-but it performs no provider mutation and records only a hash receipt. The
-production path remains stopped before mutation until that remote canary and a
-fixed controller-owned provider adapter are separately proven.
+The reusable handoff accepts only an explicit allowlisted operation. The
+ordered production chain is `provider-canary` -> `production-dns-stage` ->
+`production-bootstrap` -> `production-release` -> `production-cutover`.
+DNS-stage may create a pending production zone or renew a read-only attestation
+for an already-active exact zone, bind the exact DNS mirror and Resend
+verification records, and enforce the approved zone security settings;
+it cannot change registrar delegation or production traffic. Bootstrap accepts
+only the fresh encrypted stage receipt and independently proves active
+delegation, DS absence, exact provider state and the external WordPress fallback
+before D1 or Access provisioning. The production candidate temporarily adds
+only the public lead and webhook routes to the three Access-protected dashboard
+routes, then restores that exact three-route pre-cutover baseline. Cutover
+requires the same baseline and restores it on any material failure.
+
+The protected Cloudflare production token must be scoped only to the reviewed
+account/zone and the implemented operations. DNS stage specifically requires
+Zone:Read, DNS:Edit and Zone Settings:Edit; the last permission is exercised by
+exact readback of `ssl=strict`, `always_use_https=on` and
+`min_tls_version=1.2`. HSTS is deliberately outside this operation.
 
 Run the public-surface and adversarial checks with:
 

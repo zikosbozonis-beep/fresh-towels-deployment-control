@@ -6,6 +6,9 @@
   "engines": {
     "node": ">=22"
   },
+  "dependencies": {
+    "wrangler": "4.127.1"
+  },
   "scripts": {
     "check": "npm run scan:public && npm test",
     "scan:public": "node scripts/public-boundary-scan.mjs .",

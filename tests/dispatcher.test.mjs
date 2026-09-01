@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import { generateKeyPairSync, webcrypto } from "node:crypto";
 import test from "node:test";
 import { canonicalJson, sha256 } from "../scripts/control-contract.mjs";
-import { finishExecution, handleDispatch, safeRejectionReason } from "../dispatcher/worker.mjs";
+import {
+  finishExecution,
+  handleDispatch,
+  safeRejectionReason,
+  verifyExecutionPrerequisite,
+} from "../dispatcher/worker.mjs";
 
 globalThis.crypto ??= webcrypto;
 
@@ -40,6 +45,7 @@ class FakeD1 {
                 jti,
                 nonce,
                 digest,
+                operation,
                 sourceRepositoryId,
                 sourceSha,
                 controllerShaValue,
@@ -61,6 +67,7 @@ class FakeD1 {
                 digest,
                 jti,
                 nonce,
+                operation,
                 requestId,
                 runAttempt,
                 runId,
@@ -73,6 +80,58 @@ class FakeD1 {
               return { meta: { changes: 1 }, success: true };
             }
             if (sql.startsWith("UPDATE")) {
+              if (sql.includes("SET prerequisite_request_id")) {
+                const [
+                  prerequisiteRequestId,
+                  prerequisiteReceiptSha256,
+                  updatedAt,
+                  requestId,
+                  digest,
+                  operation,
+                  controllerRunId,
+                  controllerRunAttempt,
+                  repeatedPrerequisiteRequestId,
+                  prerequisiteOperation,
+                  sourceRepositoryId,
+                  sourceSha,
+                  controllerSha,
+                  prerequisiteRunId,
+                  repeatedPrerequisiteReceiptSha256,
+                  earliestAccepted,
+                ] = values;
+                const row = database.rows.get(requestId);
+                const prerequisite = database.rows.get(repeatedPrerequisiteRequestId);
+                const alreadyConsumed = [...database.rows.values()].some(
+                  (candidate) => candidate.prerequisiteRequestId === prerequisiteRequestId,
+                );
+                if (
+                  !row ||
+                  row.state !== "executing" ||
+                  row.digest !== digest ||
+                  row.operation !== operation ||
+                  row.controllerRunId !== controllerRunId ||
+                  row.controllerRunAttempt !== controllerRunAttempt ||
+                  row.prerequisiteRequestId !== undefined ||
+                  alreadyConsumed ||
+                  !prerequisite ||
+                  prerequisite.operation !== prerequisiteOperation ||
+                  prerequisite.state !== "executed" ||
+                  prerequisite.sourceRepositoryId !== sourceRepositoryId ||
+                  prerequisite.sourceSha !== sourceSha ||
+                  prerequisite.controllerSha !== controllerSha ||
+                  String(prerequisite.controllerRunId) !== prerequisiteRunId ||
+                  prerequisite.receipt !== repeatedPrerequisiteReceiptSha256 ||
+                  prerequisite.updatedAt < earliestAccepted
+                ) {
+                  return { meta: { changes: 0 }, success: true };
+                }
+                Object.assign(row, {
+                  prerequisiteReceiptSha256,
+                  prerequisiteRequestId,
+                  updatedAt,
+                });
+                return { meta: { changes: 1 }, success: true };
+              }
               if (sql.includes("SET state = 'executing'")) {
                 const [
                   executorJti,
@@ -518,6 +577,130 @@ test("the same protected run records one hash-only terminal execution receipt", 
   );
 });
 
+test("production prerequisites are fresh, exact, and consumed only once", async () => {
+  const database = new FakeD1();
+  const prerequisiteRequestId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const currentRequestId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const secondRequestId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const receipt = "9".repeat(64);
+  const common = {
+    controllerSha,
+    sourceRepositoryId: "1001",
+    sourceSha,
+  };
+  database.rows.set(prerequisiteRequestId, {
+    ...common,
+    controllerRunId: "8000",
+    operation: "production-dns-stage",
+    receipt,
+    requestId: prerequisiteRequestId,
+    state: "executed",
+    updatedAt: now - 1000,
+  });
+  for (const requestId of [currentRequestId, secondRequestId]) {
+    database.rows.set(requestId, {
+      ...common,
+      controllerRunAttempt: 1,
+      controllerRunId: requestId === currentRequestId ? "8100" : "8200",
+      digest: requestId === currentRequestId ? "7".repeat(64) : "8".repeat(64),
+      operation: "production-bootstrap",
+      requestId,
+      state: "executing",
+      updatedAt: now,
+    });
+  }
+  const request = {
+    operation: "production-bootstrap",
+    requestId: currentRequestId,
+    source: { repositoryId: "1001", commitSha: sourceSha },
+    controller: { commitSha: controllerSha },
+  };
+  await assert.rejects(
+    verifyExecutionPrerequisite(
+      request,
+      { run_id: "8100", run_attempt: "1" },
+      "7".repeat(64),
+      prerequisiteRequestId,
+      receipt,
+      "7999",
+      { DISPATCH_STATE: database },
+      now,
+    ),
+    /not proven/,
+  );
+  await verifyExecutionPrerequisite(
+    request,
+    { run_id: "8100", run_attempt: "1" },
+    "7".repeat(64),
+    prerequisiteRequestId,
+    receipt,
+    "8000",
+    { DISPATCH_STATE: database },
+    now,
+  );
+  assert.equal(database.rows.get(currentRequestId).prerequisiteRequestId, prerequisiteRequestId);
+  await assert.rejects(
+    verifyExecutionPrerequisite(
+      { ...request, requestId: secondRequestId },
+      { run_id: "8200", run_attempt: "1" },
+      "8".repeat(64),
+      prerequisiteRequestId,
+      receipt,
+      "8000",
+      { DISPATCH_STATE: database },
+      now,
+    ),
+    /not proven/,
+  );
+});
+
+test("stale or cross-release prerequisites fail closed", async () => {
+  const database = new FakeD1();
+  const prerequisiteRequestId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  const currentRequestId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+  database.rows.set(prerequisiteRequestId, {
+    controllerSha,
+    controllerRunId: "8050",
+    operation: "provider-canary",
+    receipt: "6".repeat(64),
+    requestId: prerequisiteRequestId,
+    sourceRepositoryId: "1001",
+    sourceSha,
+    state: "executed",
+    updatedAt: now - 24 * 60 * 60 * 1000 - 1,
+  });
+  database.rows.set(currentRequestId, {
+    controllerRunAttempt: 1,
+    controllerRunId: "8300",
+    controllerSha,
+    digest: "5".repeat(64),
+    operation: "production-bootstrap",
+    requestId: currentRequestId,
+    sourceRepositoryId: "1001",
+    sourceSha,
+    state: "executing",
+    updatedAt: now,
+  });
+  await assert.rejects(
+    verifyExecutionPrerequisite(
+      {
+        operation: "production-bootstrap",
+        requestId: currentRequestId,
+        source: { repositoryId: "1001", commitSha: sourceSha },
+        controller: { commitSha: controllerSha },
+      },
+      { run_id: "8300", run_attempt: "1" },
+      "5".repeat(64),
+      prerequisiteRequestId,
+      "6".repeat(64),
+      "8050",
+      { DISPATCH_STATE: database },
+      now,
+    ),
+    /not proven/,
+  );
+});
+
 test("executor self/substitution identities fail before execution state changes", async () => {
   const value = await fixture();
   assert.equal(
@@ -600,5 +783,54 @@ test("canary executor identity is bound to the reviewed canary environment", asy
   assert.equal(
     (await handleDispatch(request, value.applicationEnvironment, value.fetcher, now)).status,
     202,
+  );
+});
+
+test("provider Canary is bound to the protected production credential environment", async () => {
+  const value = await fixture({}, "provider-canary");
+  assert.equal(
+    (await handleDispatch(value.makeRequest(), value.applicationEnvironment, value.fetcher, now))
+      .status,
+    202,
+  );
+  const productionToken = await jwt(value.oidcKeys.privateKey, executorClaims());
+  const productionRequest = new Request("https://dispatcher.example/v1/execute-claim", {
+    body: JSON.stringify({ releaseRequestBase64: value.encoded }),
+    headers: {
+      authorization: `Bearer ${productionToken}`,
+      "content-type": "application/json",
+    },
+    method: "POST",
+  });
+  assert.equal(
+    (await handleDispatch(productionRequest, value.applicationEnvironment, value.fetcher, now))
+      .status,
+    202,
+  );
+
+  const second = await fixture({}, "provider-canary");
+  assert.equal(
+    (await handleDispatch(second.makeRequest(), second.applicationEnvironment, second.fetcher, now))
+      .status,
+    202,
+  );
+  const canaryToken = await jwt(
+    second.oidcKeys.privateKey,
+    executorClaims({
+      environment: "canary",
+      sub: "repo:owner@9009/control@2002:environment:canary",
+    }),
+  );
+  const canaryRequest = new Request("https://dispatcher.example/v1/execute-claim", {
+    body: JSON.stringify({ releaseRequestBase64: second.encoded }),
+    headers: {
+      authorization: `Bearer ${canaryToken}`,
+      "content-type": "application/json",
+    },
+    method: "POST",
+  });
+  assert.equal(
+    (await handleDispatch(canaryRequest, second.applicationEnvironment, second.fetcher, now)).status,
+    401,
   );
 });

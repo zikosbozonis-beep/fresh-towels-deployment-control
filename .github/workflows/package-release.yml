@@ -30,7 +30,7 @@ jobs:
           [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
           [[ "$CONTROLLER_SHA" =~ ^[a-f0-9]{40}$ ]]
           [[ "$SOURCE_SHA" == "$GITHUB_SHA" ]]
-          [[ "$RELEASE_OPERATION" =~ ^(canary|production-release)$ ]]
+          [[ "$RELEASE_OPERATION" =~ ^(canary|provider-canary|production-dns-stage|production-bootstrap|production-release|production-cutover)$ ]]
 
       - name: Checkout exact public controller
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -180,4 +180,13 @@ jobs:
       - name: Remove local transport material
         if: always()
         shell: bash
-        run: rm -rf "$RUNNER_TEMP/release.gpg" "$RUNNER_TEMP/manifest.json" "$RUNNER_TEMP/transport.json" "$RUNNER_TEMP/packaging-oidc.jwt"
+        run: >-
+          rm -rf
+          "$RUNNER_TEMP/private-capsule"
+          "$RUNNER_TEMP/payload.bin"
+          "$RUNNER_TEMP/envelope.tar"
+          "$RUNNER_TEMP/control-gpg"
+          "$RUNNER_TEMP/release.gpg"
+          "$RUNNER_TEMP/manifest.json"
+          "$RUNNER_TEMP/transport.json"
+          "$RUNNER_TEMP/packaging-oidc.jwt"
