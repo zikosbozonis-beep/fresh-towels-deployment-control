@@ -337,26 +337,46 @@ export function validateDecryptionBindings(environment) {
   return { passphrase, privateKey };
 }
 
-export function validateImportedSecretKey(listing, expectedFingerprint) {
-  if (typeof listing !== "string" || !/^[A-F0-9]{40}$/.test(expectedFingerprint)) {
+export function validateImportedSecretKey(
+  listing,
+  expectedPrimaryFingerprint,
+  expectedEncryptionSubkeyFingerprint,
+) {
+  if (
+    typeof listing !== "string" ||
+    !/^[A-F0-9]{40}$/.test(expectedPrimaryFingerprint) ||
+    !/^[A-F0-9]{40}$/.test(expectedEncryptionSubkeyFingerprint)
+  ) {
     throw new Error("Pinned release decryption fingerprint is invalid");
   }
-  const primaryFingerprints = [];
-  let awaitingFingerprint = false;
+  const keys = [];
+  let awaitingFingerprint;
   for (const line of listing.split("\n")) {
     const fields = line.split(":");
-    if (fields[0] === "sec") {
-      awaitingFingerprint = true;
+    if (fields[0] === "sec" || fields[0] === "ssb") {
+      awaitingFingerprint = {
+        capabilities: (fields[11] ?? "").toLowerCase(),
+        fingerprint: "",
+        record: fields[0],
+      };
     } else if (fields[0] === "fpr" && awaitingFingerprint) {
-      primaryFingerprints.push(fields[9] ?? "");
-      awaitingFingerprint = false;
+      awaitingFingerprint.fingerprint = fields[9] ?? "";
+      keys.push(awaitingFingerprint);
+      awaitingFingerprint = undefined;
     }
   }
-  if (
-    primaryFingerprints.length !== 1 ||
-    primaryFingerprints[0] !== expectedFingerprint
-  ) {
+  const primaryKeys = keys.filter((key) => key.record === "sec");
+  if (primaryKeys.length !== 1 || primaryKeys[0].fingerprint !== expectedPrimaryFingerprint) {
     throw new Error("Imported release decryption key fingerprint differs");
+  }
+  const encryptionSubkeys = keys.filter(
+    (key) => key.record === "ssb" && key.capabilities.includes("e"),
+  );
+  if (
+    encryptionSubkeys.length !== 1 ||
+    encryptionSubkeys[0].fingerprint !== expectedEncryptionSubkeyFingerprint
+  ) {
+    throw new Error("Imported release secret encryption subkey differs");
   }
   return true;
 }
@@ -575,7 +595,13 @@ async function fetchTransport(request, environment, root) {
   return { ciphertextPath, manifestBytes };
 }
 
-async function decrypt(ciphertextPath, environment, root) {
+export async function decryptBoundCiphertext(
+  ciphertextPath,
+  environment,
+  root,
+  expectedPrimaryFingerprint,
+  expectedEncryptionSubkeyFingerprint,
+) {
   const bindings = validateDecryptionBindings(environment);
   const gpgHome = join(root, "gpg");
   await mkdir(gpgHome, { mode: 0o700 });
@@ -608,19 +634,18 @@ async function decrypt(ciphertextPath, environment, root) {
       "--with-colons",
       "--list-secret-keys",
       "--fingerprint",
+      "--fingerprint",
     ],
     { encoding: "utf8", env: cleanEnvironment, windowsHide: true },
   );
   if (fingerprintResult.status !== 0) {
     throw new Error("Offline GPG secret-key inspection failed");
   }
-  const expectedFingerprint = (
-    await readFile(
-      fileURLToPath(new URL("../keys/release-encryption-fingerprint.txt", import.meta.url)),
-      "utf8",
-    )
-  ).trim();
-  validateImportedSecretKey(fingerprintResult.stdout, expectedFingerprint);
+  validateImportedSecretKey(
+    fingerprintResult.stdout,
+    expectedPrimaryFingerprint,
+    expectedEncryptionSubkeyFingerprint,
+  );
   const decryptResult = spawnSync(
     "gpg",
     [
@@ -649,6 +674,28 @@ async function decrypt(ciphertextPath, environment, root) {
   );
   if (decryptResult.status !== 0) throw new Error("Offline GPG decryption failed");
   return envelopePath;
+}
+
+async function decrypt(ciphertextPath, environment, root) {
+  const [expectedPrimaryFingerprint, expectedEncryptionSubkeyFingerprint] = await Promise.all([
+    readFile(
+      fileURLToPath(new URL("../keys/release-encryption-fingerprint.txt", import.meta.url)),
+      "utf8",
+    ).then((value) => value.trim()),
+    readFile(
+      fileURLToPath(
+        new URL("../keys/release-encryption-subkey-fingerprint.txt", import.meta.url),
+      ),
+      "utf8",
+    ).then((value) => value.trim()),
+  ]);
+  return decryptBoundCiphertext(
+    ciphertextPath,
+    environment,
+    root,
+    expectedPrimaryFingerprint,
+    expectedEncryptionSubkeyFingerprint,
+  );
 }
 
 export async function verifyProtectedTransport(environment = process.env) {

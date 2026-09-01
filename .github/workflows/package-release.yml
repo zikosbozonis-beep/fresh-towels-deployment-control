@@ -51,6 +51,7 @@ jobs:
           node .controller/scripts/public-boundary-scan.mjs .controller
           test -f .controller/keys/release-encryption-public.asc
           test -f .controller/keys/release-encryption-fingerprint.txt
+          test -f .controller/keys/release-encryption-subkey-fingerprint.txt
           node .controller/scripts/prepare-packaging.mjs
 
       - name: Download plaintext capsule only inside private caller run
@@ -119,10 +120,24 @@ jobs:
           gpg_home="$RUNNER_TEMP/control-gpg"
           install -d -m 700 "$gpg_home"
           gpg --batch --homedir "$gpg_home" --import .controller/keys/release-encryption-public.asc
-          fingerprint="$(tr -d '\r\n ' < .controller/keys/release-encryption-fingerprint.txt)"
-          [[ "$fingerprint" =~ ^[A-F0-9]{40}$ ]]
+          primary_fingerprint="$(tr -d '\r\n ' < .controller/keys/release-encryption-fingerprint.txt)"
+          encryption_fingerprint="$(tr -d '\r\n ' < .controller/keys/release-encryption-subkey-fingerprint.txt)"
+          [[ "$primary_fingerprint" =~ ^[A-F0-9]{40}$ ]]
+          [[ "$encryption_fingerprint" =~ ^[A-F0-9]{40}$ ]]
+          mapfile -t imported_fingerprints < <(
+            gpg --batch --homedir "$gpg_home" --with-colons --list-keys \
+              --fingerprint --fingerprint "$primary_fingerprint" |
+              awk -F: '
+                $1 == "pub" { record = "pub"; next }
+                $1 == "sub" && tolower($12) ~ /e/ { record = "encryption-subkey"; next }
+                $1 == "fpr" && record != "" { print record ":" $10; record = "" }
+              '
+          )
+          [[ "${#imported_fingerprints[@]}" == 2 ]]
+          [[ "${imported_fingerprints[0]}" == "pub:${primary_fingerprint}" ]]
+          [[ "${imported_fingerprints[1]}" == "encryption-subkey:${encryption_fingerprint}" ]]
           gpg --batch --homedir "$gpg_home" --trust-model always \
-            --recipient "$fingerprint" --output "$RUNNER_TEMP/release.gpg" \
+            --recipient "${encryption_fingerprint}!" --output "$RUNNER_TEMP/release.gpg" \
             --encrypt "$RUNNER_TEMP/envelope.tar"
           chmod 400 "$RUNNER_TEMP/release.gpg"
           echo "cipher_sha=$(sha256sum "$RUNNER_TEMP/release.gpg" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
