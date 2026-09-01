@@ -36,7 +36,7 @@ async function main() {
     expiresAt: new Date(now.getTime() + 30 * 60 * 1000).toISOString(),
     issuedAt: now.toISOString(),
     nonce: manifest.nonce,
-    operation: 'production-release',
+    operation: required('RELEASE_OPERATION'),
     requestId: manifest.requestId,
     schema: 'deployment-control/release-request/v1',
     source: manifest.source,

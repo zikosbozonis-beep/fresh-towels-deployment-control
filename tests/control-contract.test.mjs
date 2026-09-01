@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import {
   canonicalJson,
+  decodeCanonicalBase64Url,
   sha256,
   validateApprovalHistory,
   validateDispatchContext,
@@ -64,6 +65,12 @@ test('accepts one canonical, short-lived exact-SHA request', () => {
   const result = validateReleaseRequest(value, expected);
   assert.equal(result.digest, sha256(Buffer.from(canonicalJson(value))));
   assert.equal(result.request.source.commitSha, '1'.repeat(40));
+});
+
+test('rejects alternate base64url pad-bit spellings of identical bytes', () => {
+  assert.deepEqual(decodeCanonicalBase64Url('_w'), Buffer.from([0xff]));
+  assert.deepEqual(Buffer.from('_x', 'base64url'), Buffer.from([0xff]));
+  assert.throws(() => decodeCanonicalBase64Url('_x'), /not canonical/);
 });
 
 test('rejects mutable refs, altered repository identity and unknown fields', () => {

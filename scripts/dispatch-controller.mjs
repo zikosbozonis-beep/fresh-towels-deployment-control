@@ -2,6 +2,10 @@
 
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import {
+  decodeCanonicalBase64Url,
+  validateReleaseRequest,
+} from './control-contract.mjs';
 
 function required(name, pattern) {
   const value = process.env[name]?.trim();
@@ -10,8 +14,9 @@ function required(name, pattern) {
 }
 
 async function main() {
-  const [identityPath, oidcPath] = process.argv.slice(2);
+  const [identityPath, oidcPath, mode = 'dispatch'] = process.argv.slice(2);
   if (!identityPath || !oidcPath) throw new Error('identity and OIDC paths are required');
+  if (!['dispatch', 'execute-claim', 'execute-finish'].includes(mode)) throw new Error('dispatcher operation is invalid');
   const identity = JSON.parse(await readFile(resolve(identityPath), 'utf8'));
   if (
     identity.configured !== true ||
@@ -40,15 +45,35 @@ async function main() {
     'RELEASE_REQUEST_BASE64',
     /^[A-Za-z0-9_-]{100,32768}$/,
   );
-  const response = await fetch(new URL('/v1/dispatch', origin), {
+  const releaseRequest = JSON.parse(
+    decodeCanonicalBase64Url(
+      releaseRequestBase64,
+      'RELEASE_REQUEST_BASE64',
+    ).toString('utf8'),
+  );
+  const expectedReceipt = validateReleaseRequest(releaseRequest);
+  const body = { releaseRequestBase64 };
+  if (mode === 'execute-finish') {
+    body.outcome = required('EXECUTION_OUTCOME', /^(canary_verified|executed|execution_ambiguous)$/);
+    body.providerReceiptSha256 = required('PROVIDER_RECEIPT_SHA256', /^[a-f0-9]{64}$/);
+  }
+  const endpoint = {
+    dispatch: '/v1/dispatch',
+    'execute-claim': '/v1/execute-claim',
+    'execute-finish': '/v1/execute-finish',
+  }[mode];
+  const response = await fetch(
+    new URL(endpoint, origin),
+    {
     method: 'POST',
     headers: {
       authorization: `Bearer ${oidc}`,
       'content-type': 'application/json',
       'user-agent': 'deployment-control-packager',
     },
-    body: JSON.stringify({ releaseRequestBase64 }),
-  });
+    body: JSON.stringify(body),
+    },
+  );
   if (response.status !== 202) {
     throw new Error(`OIDC dispatcher returned ${response.status}`);
   }
@@ -60,6 +85,12 @@ async function main() {
     !/^[a-f0-9]{64}$/.test(receipt.requestDigest)
   ) {
     throw new Error('OIDC dispatcher receipt is invalid');
+  }
+  if (
+    receipt.requestId !== expectedReceipt.request.requestId ||
+    receipt.requestDigest !== expectedReceipt.digest
+  ) {
+    throw new Error('OIDC dispatcher receipt differs from the requested release');
   }
   process.stdout.write(`${JSON.stringify(receipt)}\n`);
 }

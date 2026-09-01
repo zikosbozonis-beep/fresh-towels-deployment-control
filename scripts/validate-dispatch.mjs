@@ -2,7 +2,11 @@
 
 import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { validateDispatchContext, validateReleaseRequest } from './control-contract.mjs';
+import {
+  decodeCanonicalBase64Url,
+  validateDispatchContext,
+  validateReleaseRequest,
+} from './control-contract.mjs';
 
 function requiredEnvironment(name) {
   const value = process.env[name]?.trim();
@@ -37,7 +41,10 @@ async function main() {
   ) {
     throw new Error('release_request_base64 is invalid');
   }
-  const requestBytes = Buffer.from(encodedRequest, 'base64url');
+  const requestBytes = decodeCanonicalBase64Url(
+    encodedRequest,
+    'release_request_base64',
+  );
   if (requestBytes.length < 2 || requestBytes.length > 24_576) {
     throw new Error('decoded release request size is invalid');
   }

@@ -86,7 +86,7 @@ function pathIsAllowlisted(path) {
     'package.json',
   ]);
   if (rootFiles.has(path)) return true;
-  return /^(?:dispatcher\/[A-Za-z0-9_.-]+\.mjs|docs\/[A-Za-z0-9_.-]+\.md|schemas\/[A-Za-z0-9_.-]+\.json|scripts\/[A-Za-z0-9_.-]+\.mjs|tests\/[A-Za-z0-9_.-]+\.test\.mjs|\.github\/workflows\/[A-Za-z0-9_.-]+\.yml|keys\/(?:README\.md|github-known-hosts|release-encryption-public\.asc|release-encryption-fingerprint\.txt))$/.test(
+  return /^(?:dispatcher\/(?:[A-Za-z0-9_.-]+\.(?:mjs|jsonc)|migrations\/[0-9]{4}_[A-Za-z0-9_.-]+\.sql)|docs\/[A-Za-z0-9_.-]+\.md|schemas\/[A-Za-z0-9_.-]+\.json|scripts\/[A-Za-z0-9_.-]+\.mjs|tests\/[A-Za-z0-9_.-]+\.test\.mjs|\.github\/workflows\/[A-Za-z0-9_.-]+\.yml|keys\/(?:README\.md|github-known-hosts|release-encryption-public\.asc|release-encryption-fingerprint\.txt))$/.test(
     path,
   );
 }
@@ -112,7 +112,8 @@ export async function scanPublicSurface(rootPath) {
     }
     if (
       forbiddenBasenames.has(name.toLowerCase()) ||
-      forbiddenExtensions.has(extensionOf(normalized)) ||
+      (forbiddenExtensions.has(extensionOf(normalized)) &&
+        !/^dispatcher\/migrations\/[0-9]{4}_[A-Za-z0-9_.-]+\.sql$/.test(normalized)) ||
       /(^|\/)\.env(?:\.|$)/i.test(normalized)
     ) {
       findings.push(`${normalized}: forbidden public file type or name`);
