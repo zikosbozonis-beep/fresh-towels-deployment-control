@@ -3,14 +3,74 @@ import test from "node:test";
 import { canonicalJson, sha256 } from "../scripts/control-contract.mjs";
 import {
   parseFixedEnvelope,
+  validateTransportBindings,
   validateManifest,
   validateOperationPayload,
   validateTransportTree,
 } from "../scripts/protected-transport.mjs";
 
+const privateKeyHeader = ["-----BEGIN OPENSSH ", "PRIVATE KEY-----"].join("");
+const privateKeyFooter = ["-----END OPENSSH ", "PRIVATE KEY-----"].join("");
+
+function transportEnvironment(overrides = {}) {
+  const key = `${privateKeyHeader}\nQUJDRA==\nRUZHSA==\n${privateKeyFooter}\n`;
+  const gitUrl = "git@github.com:owner/private-app.git";
+  return {
+    PRIVATE_TRANSPORT_DEPLOY_KEY: key,
+    PRIVATE_TRANSPORT_DEPLOY_KEY_SHA256: sha256(Buffer.from(key)),
+    PRIVATE_TRANSPORT_GIT_URL: gitUrl,
+    PRIVATE_TRANSPORT_GIT_URL_SHA256: sha256(Buffer.from(gitUrl)),
+    ...overrides,
+  };
+}
+
 function tarOctal(value, width) {
   return `${value.toString(8).padStart(width - 1, "0")}\0`;
 }
+
+test("transport credentials are bound to exact canonical key bytes and repository URL", () => {
+  const environment = transportEnvironment();
+  assert.deepEqual(validateTransportBindings(environment), {
+    deployKey: environment.PRIVATE_TRANSPORT_DEPLOY_KEY,
+    gitUrl: environment.PRIVATE_TRANSPORT_GIT_URL,
+  });
+  const crlf = environment.PRIVATE_TRANSPORT_DEPLOY_KEY.replaceAll("\n", "\r\n");
+  assert.equal(
+    validateTransportBindings({ ...environment, PRIVATE_TRANSPORT_DEPLOY_KEY: crlf }).deployKey,
+    environment.PRIVATE_TRANSPORT_DEPLOY_KEY,
+  );
+});
+
+test("malformed, substituted, or repository-mismatched transport credentials fail pre-network", () => {
+  const environment = transportEnvironment();
+  assert.throws(
+    () =>
+      validateTransportBindings({
+        ...environment,
+        PRIVATE_TRANSPORT_DEPLOY_KEY: environment.PRIVATE_TRANSPORT_DEPLOY_KEY.replaceAll(
+          "\n",
+          " ",
+        ),
+      }),
+    /material is invalid/,
+  );
+  assert.throws(
+    () =>
+      validateTransportBindings({
+        ...environment,
+        PRIVATE_TRANSPORT_DEPLOY_KEY_SHA256: "0".repeat(64),
+      }),
+    /secret binding differs/,
+  );
+  assert.throws(
+    () =>
+      validateTransportBindings({
+        ...environment,
+        PRIVATE_TRANSPORT_GIT_URL: "git@github.com:owner/other-private-app.git",
+      }),
+    /repository binding differs/,
+  );
+});
 
 function tar(entries) {
   const chunks = [];
