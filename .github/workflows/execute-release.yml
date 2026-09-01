@@ -78,6 +78,13 @@ jobs:
           PROTECTED_ENVIRONMENT_NAME: ${{ needs.intake.outputs.operation == 'canary' && 'canary' || 'production' }}
           REQUESTER_ACTOR_ID: ${{ github.actor_id }}
         run: node scripts/verify-approval.mjs
+      - name: Prove exact protected GPG pair offline
+        env:
+          RELEASE_DECRYPTION_PRIVATE_KEY: ${{ secrets.RELEASE_DECRYPTION_PRIVATE_KEY }}
+          RELEASE_DECRYPTION_PRIVATE_KEY_SHA256: ${{ secrets.RELEASE_DECRYPTION_PRIVATE_KEY_SHA256 }}
+          RELEASE_DECRYPTION_PASSPHRASE: ${{ secrets.RELEASE_DECRYPTION_PASSPHRASE }}
+          RELEASE_DECRYPTION_PASSPHRASE_SHA256: ${{ secrets.RELEASE_DECRYPTION_PASSPHRASE_SHA256 }}
+        run: node scripts/gpg-offline-proof.mjs
       - name: Acquire protected-executor identity
         shell: bash
         env:

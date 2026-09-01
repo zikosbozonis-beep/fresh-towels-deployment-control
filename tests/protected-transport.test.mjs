@@ -40,6 +40,22 @@ function decryptionEnvironment(overrides = {}) {
   };
 }
 
+function secretListing(primaryFingerprint, encryptionSubkeyFingerprint) {
+  const record = (type, capabilities) => {
+    const fields = Array(13).fill("");
+    fields[0] = type;
+    fields[11] = capabilities;
+    return fields.join(":");
+  };
+  return [
+    record("sec", "c"),
+    `fpr:::::::::${primaryFingerprint}:`,
+    record("ssb", "e"),
+    `fpr:::::::::${encryptionSubkeyFingerprint}:`,
+    "",
+  ].join("\n");
+}
+
 function tarOctal(value, width) {
   return `${value.toString(8).padStart(width - 1, "0")}\0`;
 }
@@ -120,10 +136,35 @@ test("stale private-key or passphrase material and wrong imported fingerprints f
       }),
     /passphrase binding differs/,
   );
-  const fingerprint = "A".repeat(40);
-  const listing = `sec:-:255:22:KEY:::::::\nfpr:::::::::${fingerprint}:\n`;
-  assert.equal(validateImportedSecretKey(listing, fingerprint), true);
-  assert.throws(() => validateImportedSecretKey(listing, "B".repeat(40)), /fingerprint differs/);
+  const primaryFingerprint = "A".repeat(40);
+  const encryptionSubkeyFingerprint = "C".repeat(40);
+  const listing = secretListing(primaryFingerprint, encryptionSubkeyFingerprint);
+  assert.equal(
+    validateImportedSecretKey(listing, primaryFingerprint, encryptionSubkeyFingerprint),
+    true,
+  );
+  assert.throws(
+    () =>
+      validateImportedSecretKey(
+        listing,
+        "B".repeat(40),
+        encryptionSubkeyFingerprint,
+      ),
+    /fingerprint differs/,
+  );
+  assert.throws(
+    () => validateImportedSecretKey(listing, primaryFingerprint, "D".repeat(40)),
+    /encryption subkey differs/,
+  );
+  assert.throws(
+    () =>
+      validateImportedSecretKey(
+        secretListing(primaryFingerprint, primaryFingerprint),
+        primaryFingerprint,
+        encryptionSubkeyFingerprint,
+      ),
+    /encryption subkey differs/,
+  );
 });
 
 function tar(entries) {

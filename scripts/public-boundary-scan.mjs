@@ -78,6 +78,7 @@ async function publicFiles(root) {
 
 function pathIsAllowlisted(path) {
   const rootFiles = new Set([
+    '.gitattributes',
     '.gitignore',
     'LICENSE',
     'README.md',
@@ -86,7 +87,7 @@ function pathIsAllowlisted(path) {
     'package.json',
   ]);
   if (rootFiles.has(path)) return true;
-  return /^(?:dispatcher\/(?:[A-Za-z0-9_.-]+\.(?:mjs|jsonc)|migrations\/[0-9]{4}_[A-Za-z0-9_.-]+\.sql)|docs\/[A-Za-z0-9_.-]+\.md|schemas\/[A-Za-z0-9_.-]+\.json|scripts\/[A-Za-z0-9_.-]+\.mjs|tests\/[A-Za-z0-9_.-]+\.test\.mjs|\.github\/workflows\/[A-Za-z0-9_.-]+\.yml|keys\/(?:README\.md|github-known-hosts|release-encryption-public\.asc|release-encryption-fingerprint\.txt))$/.test(
+  return /^(?:dispatcher\/(?:[A-Za-z0-9_.-]+\.(?:mjs|jsonc)|migrations\/[0-9]{4}_[A-Za-z0-9_.-]+\.sql)|docs\/[A-Za-z0-9_.-]+\.md|schemas\/[A-Za-z0-9_.-]+\.json|scripts\/[A-Za-z0-9_.-]+\.mjs|tests\/[A-Za-z0-9_.-]+\.test\.mjs|\.github\/workflows\/[A-Za-z0-9_.-]+\.yml|keys\/(?:README\.md|github-known-hosts|release-encryption-public\.asc|release-encryption-(?:subkey-)?fingerprint\.txt))$/.test(
     path,
   );
 }

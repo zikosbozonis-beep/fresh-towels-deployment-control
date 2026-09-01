@@ -1,0 +1,3 @@
+* text=auto eol=lf
+keys/*.asc text eol=lf
+keys/*fingerprint*.txt text eol=lf
