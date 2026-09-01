@@ -293,6 +293,74 @@ export function validateTransportBindings(environment) {
   return { deployKey, gitUrl };
 }
 
+export function validateDecryptionBindings(environment) {
+  const rawPrivateKey = required(environment, "RELEASE_DECRYPTION_PRIVATE_KEY");
+  const normalizedPrivateKey = rawPrivateKey.replaceAll("\r\n", "\n");
+  const keyLabel = "PGP";
+  const begin = `-----BEGIN ${keyLabel} PRIVATE KEY BLOCK-----`;
+  const end = `-----END ${keyLabel} PRIVATE KEY BLOCK-----`;
+  if (
+    normalizedPrivateKey.includes("\r") ||
+    normalizedPrivateKey.includes("\0") ||
+    !normalizedPrivateKey.startsWith(begin) ||
+    !normalizedPrivateKey.endsWith(end)
+  ) {
+    throw new Error("Release decryption key material is invalid");
+  }
+  const privateKey = `${normalizedPrivateKey}\n`;
+  const expectedPrivateKeySha256 = required(
+    environment,
+    "RELEASE_DECRYPTION_PRIVATE_KEY_SHA256",
+    digestPattern,
+  );
+  if (sha256(Buffer.from(privateKey)) !== expectedPrivateKeySha256) {
+    throw new Error("Release decryption key binding differs");
+  }
+
+  const passphrase = environment.RELEASE_DECRYPTION_PASSPHRASE;
+  if (
+    typeof passphrase !== "string" ||
+    passphrase.length < 16 ||
+    passphrase.length > 1024 ||
+    /[\r\n\0]/.test(passphrase)
+  ) {
+    throw new Error("release decryption passphrase is unavailable or invalid");
+  }
+  const expectedPassphraseSha256 = required(
+    environment,
+    "RELEASE_DECRYPTION_PASSPHRASE_SHA256",
+    digestPattern,
+  );
+  if (sha256(Buffer.from(passphrase)) !== expectedPassphraseSha256) {
+    throw new Error("Release decryption passphrase binding differs");
+  }
+  return { passphrase, privateKey };
+}
+
+export function validateImportedSecretKey(listing, expectedFingerprint) {
+  if (typeof listing !== "string" || !/^[A-F0-9]{40}$/.test(expectedFingerprint)) {
+    throw new Error("Pinned release decryption fingerprint is invalid");
+  }
+  const primaryFingerprints = [];
+  let awaitingFingerprint = false;
+  for (const line of listing.split("\n")) {
+    const fields = line.split(":");
+    if (fields[0] === "sec") {
+      awaitingFingerprint = true;
+    } else if (fields[0] === "fpr" && awaitingFingerprint) {
+      primaryFingerprints.push(fields[9] ?? "");
+      awaitingFingerprint = false;
+    }
+  }
+  if (
+    primaryFingerprints.length !== 1 ||
+    primaryFingerprints[0] !== expectedFingerprint
+  ) {
+    throw new Error("Imported release decryption key fingerprint differs");
+  }
+  return true;
+}
+
 function runGit(repository, arguments_, options = {}) {
   const result = spawnSync("git", ["-C", repository, ...arguments_], {
     encoding: options.encoding ?? "utf8",
@@ -508,20 +576,12 @@ async function fetchTransport(request, environment, root) {
 }
 
 async function decrypt(ciphertextPath, environment, root) {
+  const bindings = validateDecryptionBindings(environment);
   const gpgHome = join(root, "gpg");
   await mkdir(gpgHome, { mode: 0o700 });
   const privateKey = join(root, "decryption-key.asc");
   const envelopePath = join(root, "envelope.tar");
-  const passphrase = environment.RELEASE_DECRYPTION_PASSPHRASE;
-  if (
-    typeof passphrase !== "string" ||
-    passphrase.length < 16 ||
-    passphrase.length > 1024 ||
-    /[\r\n\0]/.test(passphrase)
-  ) {
-    throw new Error("release decryption passphrase is unavailable or invalid");
-  }
-  await writeFile(privateKey, required(environment, "RELEASE_DECRYPTION_PRIVATE_KEY"), {
+  await writeFile(privateKey, bindings.privateKey, {
     flag: "wx",
     mode: 0o600,
   });
@@ -538,6 +598,29 @@ async function decrypt(ciphertextPath, environment, root) {
   await chmod(privateKey, 0o600);
   await writeFile(privateKey, "", { mode: 0o600 });
   if (importResult.status !== 0) throw new Error("Offline GPG key import failed");
+  const fingerprintResult = spawnSync(
+    "gpg",
+    [
+      "--batch",
+      "--no-tty",
+      "--homedir",
+      gpgHome,
+      "--with-colons",
+      "--list-secret-keys",
+      "--fingerprint",
+    ],
+    { encoding: "utf8", env: cleanEnvironment, windowsHide: true },
+  );
+  if (fingerprintResult.status !== 0) {
+    throw new Error("Offline GPG secret-key inspection failed");
+  }
+  const expectedFingerprint = (
+    await readFile(
+      fileURLToPath(new URL("../keys/release-encryption-fingerprint.txt", import.meta.url)),
+      "utf8",
+    )
+  ).trim();
+  validateImportedSecretKey(fingerprintResult.stdout, expectedFingerprint);
   const decryptResult = spawnSync(
     "gpg",
     [
@@ -560,7 +643,7 @@ async function decrypt(ciphertextPath, environment, root) {
     {
       encoding: "utf8",
       env: cleanEnvironment,
-      input: `${passphrase}\n`,
+      input: `${bindings.passphrase}\n`,
       windowsHide: true,
     },
   );

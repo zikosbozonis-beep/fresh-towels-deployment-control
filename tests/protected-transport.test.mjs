@@ -3,6 +3,8 @@ import test from "node:test";
 import { canonicalJson, sha256 } from "../scripts/control-contract.mjs";
 import {
   parseFixedEnvelope,
+  validateDecryptionBindings,
+  validateImportedSecretKey,
   validateTransportBindings,
   validateManifest,
   validateOperationPayload,
@@ -11,6 +13,8 @@ import {
 
 const privateKeyHeader = ["-----BEGIN OPENSSH ", "PRIVATE KEY-----"].join("");
 const privateKeyFooter = ["-----END OPENSSH ", "PRIVATE KEY-----"].join("");
+const pgpPrivateKeyHeader = ["-----BEGIN PGP ", "PRIVATE KEY BLOCK-----"].join("");
+const pgpPrivateKeyFooter = ["-----END PGP ", "PRIVATE KEY BLOCK-----"].join("");
 
 function transportEnvironment(overrides = {}) {
   const key = `${privateKeyHeader}\nQUJDRA==\nRUZHSA==\n${privateKeyFooter}\n`;
@@ -20,6 +24,18 @@ function transportEnvironment(overrides = {}) {
     PRIVATE_TRANSPORT_DEPLOY_KEY_SHA256: sha256(Buffer.from(key)),
     PRIVATE_TRANSPORT_GIT_URL: gitUrl,
     PRIVATE_TRANSPORT_GIT_URL_SHA256: sha256(Buffer.from(gitUrl)),
+    ...overrides,
+  };
+}
+
+function decryptionEnvironment(overrides = {}) {
+  const privateKey = `${pgpPrivateKeyHeader}\nsynthetic-armored-material\n${pgpPrivateKeyFooter}\n`;
+  const passphrase = "synthetic-passphrase-without-production-value";
+  return {
+    RELEASE_DECRYPTION_PASSPHRASE: passphrase,
+    RELEASE_DECRYPTION_PASSPHRASE_SHA256: sha256(Buffer.from(passphrase)),
+    RELEASE_DECRYPTION_PRIVATE_KEY: privateKey,
+    RELEASE_DECRYPTION_PRIVATE_KEY_SHA256: sha256(Buffer.from(privateKey)),
     ...overrides,
   };
 }
@@ -70,6 +86,44 @@ test("malformed, substituted, or repository-mismatched transport credentials fai
       }),
     /repository binding differs/,
   );
+});
+
+test("decryption secrets are canonical and bound before GPG import or passphrase use", () => {
+  const environment = decryptionEnvironment();
+  assert.deepEqual(validateDecryptionBindings(environment), {
+    passphrase: environment.RELEASE_DECRYPTION_PASSPHRASE,
+    privateKey: environment.RELEASE_DECRYPTION_PRIVATE_KEY,
+  });
+  const crlf = environment.RELEASE_DECRYPTION_PRIVATE_KEY.replaceAll("\n", "\r\n");
+  assert.equal(
+    validateDecryptionBindings({ ...environment, RELEASE_DECRYPTION_PRIVATE_KEY: crlf })
+      .privateKey,
+    environment.RELEASE_DECRYPTION_PRIVATE_KEY,
+  );
+});
+
+test("stale private-key or passphrase material and wrong imported fingerprints fail closed", () => {
+  const environment = decryptionEnvironment();
+  assert.throws(
+    () =>
+      validateDecryptionBindings({
+        ...environment,
+        RELEASE_DECRYPTION_PRIVATE_KEY_SHA256: "0".repeat(64),
+      }),
+    /key binding differs/,
+  );
+  assert.throws(
+    () =>
+      validateDecryptionBindings({
+        ...environment,
+        RELEASE_DECRYPTION_PASSPHRASE: `${environment.RELEASE_DECRYPTION_PASSPHRASE}-stale`,
+      }),
+    /passphrase binding differs/,
+  );
+  const fingerprint = "A".repeat(40);
+  const listing = `sec:-:255:22:KEY:::::::\nfpr:::::::::${fingerprint}:\n`;
+  assert.equal(validateImportedSecretKey(listing, fingerprint), true);
+  assert.throws(() => validateImportedSecretKey(listing, "B".repeat(40)), /fingerprint differs/);
 });
 
 function tar(entries) {
