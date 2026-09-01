@@ -1,0 +1,14 @@
+{
+  "name": "fresh-towels-deployment-control",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "npm run scan:public && npm test",
+    "scan:public": "node scripts/public-boundary-scan.mjs .",
+    "test": "node --test --test-reporter=spec"
+  }
+}

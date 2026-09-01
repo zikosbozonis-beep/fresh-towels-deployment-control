@@ -1,0 +1,164 @@
+name: Package Private Release
+
+on:
+  workflow_call:
+    inputs:
+      artifact_name: { required: true, type: string }
+      artifact_filename: { required: true, type: string }
+      artifact_plaintext_sha256: { required: true, type: string }
+      artifact_plaintext_bytes: { required: true, type: number }
+      source_sha: { required: true, type: string }
+      controller_sha: { required: true, type: string }
+jobs:
+  handoff:
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Reject mutable or mismatched identities
+        shell: bash
+        env:
+          CONTROLLER_SHA: ${{ inputs.controller_sha }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$CONTROLLER_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$SOURCE_SHA" == "$GITHUB_SHA" ]]
+
+      - name: Checkout exact public controller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zikosbozonis-beep/fresh-towels-deployment-control
+          ref: ${{ inputs.controller_sha }}
+          path: .controller
+          persist-credentials: false
+
+      - name: Verify controller and generate request identity
+        id: identity
+        shell: bash
+        env:
+          CONTROLLER_SHA: ${{ inputs.controller_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git -C .controller rev-parse HEAD)" == "$CONTROLLER_SHA" ]]
+          node .controller/scripts/public-boundary-scan.mjs .controller
+          test -f .controller/keys/release-encryption-public.asc
+          test -f .controller/keys/release-encryption-fingerprint.txt
+          node .controller/scripts/prepare-packaging.mjs
+
+      - name: Download plaintext capsule only inside private caller run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ runner.temp }}/private-capsule
+
+      - name: Acquire GitHub-signed reusable-workflow identity
+        id: oidc
+        shell: bash
+        env:
+          OIDC_AUDIENCE: deployment-control-packaging-v1
+        run: |
+          set -euo pipefail
+          response="$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
+          RESPONSE="$response" node -e \
+            'const fs=require("fs");const d=JSON.parse(process.env.RESPONSE);if(typeof d.value!=="string"||d.value.length<100)process.exit(1);fs.writeFileSync(process.env.RUNNER_TEMP+"/packaging-oidc.jwt",d.value,{mode:0o400,flag:"wx"})'
+          unset response
+          echo "token_sha=$(sha256sum "$RUNNER_TEMP/packaging-oidc.jwt" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify payload and write canonical sanitized manifest
+        id: manifest
+        shell: bash
+        env:
+          CONTROLLER_SHA: ${{ inputs.controller_sha }}
+          OIDC_TOKEN_SHA256: ${{ steps.oidc.outputs.token_sha }}
+          ARTIFACT_FILENAME: ${{ inputs.artifact_filename }}
+          PAYLOAD_BYTES: ${{ inputs.artifact_plaintext_bytes }}
+          PAYLOAD_SHA256: ${{ inputs.artifact_plaintext_sha256 }}
+          RELEASE_NONCE: ${{ steps.identity.outputs.nonce }}
+          RELEASE_REQUEST_ID: ${{ steps.identity.outputs.request_id }}
+          SOURCE_REPOSITORY_ID: ${{ github.repository_id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_FILENAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$ ]]
+          [[ "$ARTIFACT_FILENAME" != *..* ]]
+          mapfile -d '' capsule_files < <(find "$RUNNER_TEMP/private-capsule" \
+            -mindepth 1 -maxdepth 1 -type f -print0)
+          [[ "${#capsule_files[@]}" == 1 ]]
+          payload="${capsule_files[0]}"
+          [[ "$(basename "$payload")" == "$ARTIFACT_FILENAME" ]]
+          test -f "$payload"
+          [[ ! -L "$payload" ]]
+          [[ "$(stat -c %s "$payload")" == "$PAYLOAD_BYTES" ]]
+          echo "$PAYLOAD_SHA256  $payload" | sha256sum --check --strict
+          manifest_sha="$(node .controller/scripts/write-release-manifest.mjs \
+            .controller/controller-identity.json "$RUNNER_TEMP/manifest.json")"
+          echo "manifest_sha=$manifest_sha" >> "$GITHUB_OUTPUT"
+          install -m 400 "$payload" "$RUNNER_TEMP/payload.bin"
+          rm -rf "$RUNNER_TEMP/private-capsule"
+
+      - name: Create fixed envelope and encrypt before transport publication
+        id: encrypt
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --create --file "$RUNNER_TEMP/envelope.tar" --format=ustar \
+            --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -C "$RUNNER_TEMP" manifest.json payload.bin
+          gpg_home="$RUNNER_TEMP/control-gpg"
+          install -d -m 700 "$gpg_home"
+          gpg --batch --homedir "$gpg_home" --import .controller/keys/release-encryption-public.asc
+          fingerprint="$(tr -d '\r\n ' < .controller/keys/release-encryption-fingerprint.txt)"
+          [[ "$fingerprint" =~ ^[A-F0-9]{40}$ ]]
+          gpg --batch --homedir "$gpg_home" --trust-model always \
+            --recipient "$fingerprint" --output "$RUNNER_TEMP/release.gpg" \
+            --encrypt "$RUNNER_TEMP/envelope.tar"
+          chmod 400 "$RUNNER_TEMP/release.gpg"
+          echo "cipher_sha=$(sha256sum "$RUNNER_TEMP/release.gpg" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "key_sha=$(sha256sum .controller/keys/release-encryption-public.asc | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          rm -rf "$RUNNER_TEMP/envelope.tar" "$RUNNER_TEMP/payload.bin" "$gpg_home"
+
+      - name: Publish encrypted orphan transport as immutable private Release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_REQUEST_ID: ${{ steps.identity.outputs.request_id }}
+        run: |
+          set -euo pipefail
+          node .controller/scripts/publish-private-transport.mjs \
+            "$RUNNER_TEMP/release.gpg" "$RUNNER_TEMP/manifest.json" \
+            > "$RUNNER_TEMP/transport.json"
+
+      - name: Build exact public release request
+        id: request
+        shell: bash
+        env:
+          CIPHERTEXT_SHA256: ${{ steps.encrypt.outputs.cipher_sha }}
+          ENCRYPTION_KEY_SHA256: ${{ steps.encrypt.outputs.key_sha }}
+          MANIFEST_SHA256: ${{ steps.manifest.outputs.manifest_sha }}
+        run: >-
+          node .controller/scripts/create-release-request.mjs
+          "$RUNNER_TEMP/transport.json"
+          "$RUNNER_TEMP/manifest.json"
+          > /dev/null
+
+      - name: Request App-authenticated dispatch through OIDC dispatcher
+        env:
+          RELEASE_REQUEST_BASE64: ${{ steps.request.outputs.release_request_base64 }}
+        run: >-
+          node .controller/scripts/dispatch-controller.mjs
+          .controller/controller-identity.json
+          "$RUNNER_TEMP/packaging-oidc.jwt"
+
+      - name: Remove local transport material
+        if: always()
+        shell: bash
+        run: rm -rf "$RUNNER_TEMP/release.gpg" "$RUNNER_TEMP/manifest.json" "$RUNNER_TEMP/transport.json" "$RUNNER_TEMP/packaging-oidc.jwt"

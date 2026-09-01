@@ -1,0 +1,94 @@
+name: Execute Verified Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_request_base64:
+        description: Broker-issued canonical release request
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deployment-control-production
+  cancel-in-progress: false
+
+jobs:
+  intake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      operation: ${{ steps.outputs.outputs.operation }}
+      requestDigest: ${{ steps.outputs.outputs.requestDigest }}
+      requestId: ${{ steps.outputs.outputs.requestId }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Capture checked-out controller identity
+        shell: bash
+        run: echo "CHECKED_OUT_CONTROLLER_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Validate hostile dispatch payload
+        env:
+          EXPECTED_CONTROLLER_REPOSITORY_ID: ${{ vars.EXPECTED_CONTROLLER_REPOSITORY_ID }}
+          EXPECTED_REQUESTER_ACTOR_ID: ${{ vars.EXPECTED_REQUESTER_ACTOR_ID }}
+          EXPECTED_SOURCE_REPOSITORY_ID: ${{ vars.EXPECTED_SOURCE_REPOSITORY_ID }}
+        run: >-
+          node scripts/validate-dispatch.mjs
+          --event "$GITHUB_EVENT_PATH"
+          --output "$RUNNER_TEMP/validated-release.json"
+      - name: Emit only schema-validated values
+        id: outputs
+        run: >-
+          node scripts/emit-github-outputs.mjs
+          "$RUNNER_TEMP/validated-release.json"
+          "$GITHUB_OUTPUT"
+      - run: npm run check
+
+  production:
+    needs: intake
+    if: needs.intake.outputs.operation == 'production-release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Reconfirm exact protected controller
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          node scripts/public-boundary-scan.mjs .
+      - name: Verify independent environment approval
+        env:
+          EXPECTED_REVIEWER_ACTOR_ID: ${{ vars.EXPECTED_REVIEWER_ACTOR_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
+          PROTECTED_ENVIRONMENT_NAME: production
+          REQUESTER_ACTOR_ID: ${{ github.actor_id }}
+        run: node scripts/verify-approval.mjs
+      - name: Fetch and decrypt exact approved private transport
+        env:
+          EXPECTED_CONTROLLER_REPOSITORY_ID: ${{ vars.EXPECTED_CONTROLLER_REPOSITORY_ID }}
+          EXPECTED_SOURCE_REPOSITORY_ID: ${{ vars.EXPECTED_SOURCE_REPOSITORY_ID }}
+          PRIVATE_TRANSPORT_DEPLOY_KEY: ${{ secrets.PRIVATE_TRANSPORT_DEPLOY_KEY }}
+          PRIVATE_TRANSPORT_GIT_URL: ${{ secrets.PRIVATE_TRANSPORT_GIT_URL }}
+          RELEASE_DECRYPTION_PRIVATE_KEY: ${{ secrets.RELEASE_DECRYPTION_PRIVATE_KEY }}
+          RELEASE_REQUEST_BASE64: ${{ inputs.release_request_base64 }}
+          VERIFIED_PAYLOAD_OUTPUT_DIRECTORY: ${{ runner.temp }}/verified-release
+        run: node scripts/protected-transport.mjs
+      - name: Fail closed until remote canary and executor adapter are proven
+        run: |
+          echo "::error::PROTECTED_EXECUTOR_CANARY_NOT_YET_PROVEN"
+          exit 78

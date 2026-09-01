@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/deployment-control/release-request-v1.schema.json",
+  "title": "Deployment-control release request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "requestId",
+    "nonce",
+    "issuedAt",
+    "expiresAt",
+    "operation",
+    "source",
+    "controller",
+    "artifact",
+    "evidence"
+  ],
+  "properties": {
+    "schema": { "const": "deployment-control/release-request/v1" },
+    "requestId": { "type": "string", "format": "uuid" },
+    "nonce": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+    "issuedAt": { "type": "string", "format": "date-time" },
+    "expiresAt": { "type": "string", "format": "date-time" },
+    "operation": { "enum": ["canary", "production-release"] },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repositoryId", "commitSha", "workflowRunId", "workflowRunAttempt"],
+      "properties": {
+        "repositoryId": { "type": "string", "pattern": "^[1-9][0-9]{0,19}$" },
+        "commitSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+        "workflowRunId": { "type": "string", "pattern": "^[1-9][0-9]{0,19}$" },
+        "workflowRunAttempt": { "type": "integer", "minimum": 1, "maximum": 100 }
+      }
+    },
+    "controller": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repositoryId", "commitSha"],
+      "properties": {
+        "repositoryId": { "type": "string", "pattern": "^[1-9][0-9]{0,19}$" },
+        "commitSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "releaseId",
+        "transportTag",
+        "transportCommitSha",
+        "ciphertextBlobSha1",
+        "manifestBlobSha1",
+        "ciphertextSha256",
+        "plaintextSha256",
+        "plaintextBytes",
+        "encryptionKeySha256"
+      ],
+      "properties": {
+        "releaseId": { "type": "string", "pattern": "^[1-9][0-9]{0,19}$" },
+        "transportTag": { "type": "string", "pattern": "^deployment-control/[a-f0-9-]{36}$" },
+        "transportCommitSha": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+        "ciphertextBlobSha1": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+        "manifestBlobSha1": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+        "ciphertextSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "plaintextSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "plaintextBytes": { "type": "integer", "minimum": 1, "maximum": 1073741824 },
+        "encryptionKeySha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["immutableRelease", "manifestSha256", "oidcTokenSha256"],
+      "properties": {
+        "immutableRelease": { "const": true },
+        "manifestSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "oidcTokenSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    }
+  }
+}
