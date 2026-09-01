@@ -1,28 +1,246 @@
 #!/usr/bin/env node
 
-import { spawnSync } from 'node:child_process';
-import {
-  chmod,
-  lstat,
-  mkdir,
-  mkdtemp,
-  readFile,
-  rm,
-  writeFile,
-} from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { spawnSync } from "node:child_process";
+import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   canonicalJson,
   decodeCanonicalBase64Url,
   sha256,
   validateReleaseRequest,
-} from './control-contract.mjs';
+} from "./control-contract.mjs";
 
 const maximumEnvelopeBytes = 128 * 1024 * 1024;
 const shaPattern = /^[a-f0-9]{40}$/;
 const decimalPattern = /^[1-9][0-9]{0,19}$/;
+const digestPattern = /^[a-f0-9]{64}$/;
+const privateApplicationRepository = "zikosbozonis-beep/fresh-towels-website";
+const privateApplicationWorkflow = ".github/workflows/release-handoff.yml";
+const controllerRepository = "zikosbozonis-beep/fresh-towels-deployment-control";
+const controllerWorkflow = ".github/workflows/package-release.yml";
+
+function exactKeys(value, keys, label) {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    throw new Error(`${label} must be a plain object`);
+  }
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
+    throw new Error(`${label} contains missing or unexpected fields`);
+  }
+}
+
+function canonicalInstant(value, label) {
+  if (typeof value !== "string") throw new Error(`${label} is invalid`);
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== value) {
+    throw new Error(`${label} is not canonical UTC`);
+  }
+  return timestamp;
+}
+
+function validateCapsuleWindow(capsule, request) {
+  const createdAt = canonicalInstant(capsule.createdAt, "capsule createdAt");
+  const validUntil = canonicalInstant(capsule.validUntil, "capsule validUntil");
+  const issuedAt = canonicalInstant(request.issuedAt, "request issuedAt");
+  if (
+    validUntil - createdAt !== 2 * 60 * 60 * 1000 ||
+    createdAt > issuedAt + 60_000 ||
+    createdAt < issuedAt - 30 * 60 * 1000 ||
+    validUntil <= Date.parse(request.expiresAt)
+  ) {
+    throw new Error("capsule validity window differs from the request");
+  }
+}
+
+function validateCommonCapsuleIdentity(capsule, request) {
+  exactKeys(
+    capsule.application,
+    [
+      "repository",
+      "repositoryId",
+      "ref",
+      "commitSha",
+      "workflowRef",
+      "workflowSha",
+      "runId",
+      "runAttempt",
+    ],
+    "capsule application",
+  );
+  exactKeys(capsule.controller, ["repository", "commitSha", "workflowRef"], "capsule controller");
+  const expectedApplication = {
+    repository: privateApplicationRepository,
+    repositoryId: request.source.repositoryId,
+    ref: "refs/heads/main",
+    commitSha: request.source.commitSha,
+    workflowRef: `${privateApplicationRepository}/${privateApplicationWorkflow}@refs/heads/main`,
+    workflowSha: request.source.commitSha,
+    runId: request.source.workflowRunId,
+    runAttempt: request.source.workflowRunAttempt,
+  };
+  for (const [name, expected] of Object.entries(expectedApplication)) {
+    if (capsule.application[name] !== expected) {
+      throw new Error(`capsule application ${name} differs from the signed request`);
+    }
+  }
+  const expectedController = {
+    repository: controllerRepository,
+    commitSha: request.controller.commitSha,
+    workflowRef: `${controllerRepository}/${controllerWorkflow}@${request.controller.commitSha}`,
+  };
+  for (const [name, expected] of Object.entries(expectedController)) {
+    if (capsule.controller[name] !== expected) {
+      throw new Error(`capsule controller ${name} differs from the signed request`);
+    }
+  }
+  validateCapsuleWindow(capsule, request);
+}
+
+function canaryId(capsule) {
+  return sha256(
+    Buffer.from(
+      [
+        capsule.application.commitSha,
+        capsule.controller.commitSha,
+        capsule.application.runId,
+        capsule.application.runAttempt,
+        capsule.createdAt,
+      ].join("\0"),
+      "utf8",
+    ),
+  );
+}
+
+function validateCanaryCapsule(capsule, bytes, request) {
+  exactKeys(
+    capsule,
+    [
+      "application",
+      "canary",
+      "capsuleType",
+      "controller",
+      "createdAt",
+      "operation",
+      "schemaVersion",
+      "validUntil",
+    ],
+    "canary capsule",
+  );
+  exactKeys(
+    capsule.canary,
+    ["canaryId", "intent", "productionCredentialsPresent", "providerMutationAuthorized"],
+    "canary declaration",
+  );
+  if (
+    capsule.schemaVersion !== 1 ||
+    capsule.capsuleType !== "fresh-towels-protected-executor-canary" ||
+    capsule.operation !== "canary" ||
+    capsule.canary.intent !== "verify-protected-boundary-without-provider-mutation" ||
+    capsule.canary.productionCredentialsPresent !== false ||
+    capsule.canary.providerMutationAuthorized !== false ||
+    typeof capsule.canary.canaryId !== "string" ||
+    !digestPattern.test(capsule.canary.canaryId) ||
+    capsule.canary.canaryId !== canaryId(capsule)
+  ) {
+    throw new Error("canary capsule declaration is invalid");
+  }
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  if (`${canonicalJson(capsule)}\n` !== text || bytes.byteLength > 4096) {
+    throw new Error("canary capsule is not canonical or exceeds its boundary");
+  }
+  validateCommonCapsuleIdentity(capsule, request);
+}
+
+function validateProductionCapsule(capsule, request) {
+  exactKeys(
+    capsule,
+    [
+      "application",
+      "capsuleType",
+      "controller",
+      "createdAt",
+      "operation",
+      "payload",
+      "releaseId",
+      "releaseIntegrity",
+      "schemaVersion",
+      "validUntil",
+    ],
+    "production capsule",
+  );
+  if (
+    capsule.schemaVersion !== 1 ||
+    capsule.capsuleType !== "fresh-towels-private-release-capsule" ||
+    capsule.operation !== "production-release" ||
+    typeof capsule.releaseId !== "string" ||
+    !digestPattern.test(capsule.releaseId)
+  ) {
+    throw new Error("production capsule declaration is invalid");
+  }
+  exactKeys(
+    capsule.releaseIntegrity,
+    [
+      "buildArtifactSha256",
+      "databaseSchemaSha256",
+      "releaseApprovalManifestSha256",
+      "configurationSha256",
+      "uploadArtifactSha256",
+      "capsuleTreeSha256",
+    ],
+    "production capsule integrity",
+  );
+  if (
+    Object.values(capsule.releaseIntegrity).some(
+      (value) => typeof value !== "string" || !digestPattern.test(value),
+    )
+  ) {
+    throw new Error("production capsule integrity is invalid");
+  }
+  exactKeys(
+    capsule.payload,
+    ["encoding", "rawBytes", "fileCount", "entries"],
+    "production capsule payload",
+  );
+  if (
+    capsule.payload.encoding !== "base64-per-file" ||
+    !Number.isSafeInteger(capsule.payload.rawBytes) ||
+    capsule.payload.rawBytes < 1 ||
+    capsule.payload.rawBytes > 32 * 1024 * 1024 ||
+    !Number.isSafeInteger(capsule.payload.fileCount) ||
+    capsule.payload.fileCount < 1 ||
+    capsule.payload.fileCount > 4096 ||
+    !Array.isArray(capsule.payload.entries) ||
+    capsule.payload.entries.length !== capsule.payload.fileCount
+  ) {
+    throw new Error("production capsule payload boundary is invalid");
+  }
+  validateCommonCapsuleIdentity(capsule, request);
+}
+
+export function validateOperationPayload(payload, request) {
+  let capsule;
+  try {
+    capsule = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(payload));
+  } catch {
+    throw new Error("release capsule is not valid UTF-8 JSON");
+  }
+  if (request.operation === "canary") {
+    validateCanaryCapsule(capsule, payload, request);
+  } else if (request.operation === "production-release") {
+    validateProductionCapsule(capsule, request);
+  } else {
+    throw new Error("release operation is unsupported");
+  }
+  return capsule;
+}
 
 function required(environment, name, pattern) {
   const value = environment[name]?.trim();
@@ -33,8 +251,8 @@ function required(environment, name, pattern) {
 }
 
 function runGit(repository, arguments_, options = {}) {
-  const result = spawnSync('git', ['-C', repository, ...arguments_], {
-    encoding: options.encoding ?? 'utf8',
+  const result = spawnSync("git", ["-C", repository, ...arguments_], {
+    encoding: options.encoding ?? "utf8",
     env: options.environment,
     maxBuffer: maximumEnvelopeBytes + 1024 * 1024,
     windowsHide: true,
@@ -47,42 +265,42 @@ function runGit(repository, arguments_, options = {}) {
 
 export function parseTree(raw) {
   return raw
-    .split('\0')
+    .split("\0")
     .filter(Boolean)
     .map((entry) => {
       const match = /^(\d{6}) (\w+) ([a-f0-9]{40})\t([^\0]+)$/.exec(entry);
-      if (!match) throw new Error('Transport tree entry is malformed');
+      if (!match) throw new Error("Transport tree entry is malformed");
       return { mode: match[1], type: match[2], sha: match[3], name: match[4] };
     });
 }
 
 export function validateTransportTree(entries, request) {
   const expected = new Map([
-    ['manifest.json', request.artifact.manifestBlobSha1],
-    ['release.gpg', request.artifact.ciphertextBlobSha1],
+    ["manifest.json", request.artifact.manifestBlobSha1],
+    ["release.gpg", request.artifact.ciphertextBlobSha1],
   ]);
   if (!Array.isArray(entries) || entries.length !== 2) {
-    throw new Error('Transport tree must contain exactly two entries');
+    throw new Error("Transport tree must contain exactly two entries");
   }
   for (const entry of entries) {
     if (
-      entry.mode !== '100644' ||
-      entry.type !== 'blob' ||
+      entry.mode !== "100644" ||
+      entry.type !== "blob" ||
       !expected.has(entry.name) ||
       expected.get(entry.name) !== entry.sha
     ) {
-      throw new Error('Transport tree contains an unexpected entry');
+      throw new Error("Transport tree contains an unexpected entry");
     }
     expected.delete(entry.name);
   }
-  if (expected.size !== 0) throw new Error('Transport tree is incomplete');
+  if (expected.size !== 0) throw new Error("Transport tree is incomplete");
   return true;
 }
 
 function octal(bytes, offset, length, label) {
   const text = new TextDecoder()
     .decode(bytes.subarray(offset, offset + length))
-    .replaceAll('\0', '')
+    .replaceAll("\0", "")
     .trim();
   if (!/^[0-7]+$/.test(text)) throw new Error(`Tar ${label} is invalid`);
   return Number.parseInt(text, 8);
@@ -97,7 +315,7 @@ function tarString(bytes, offset, length) {
 export function parseFixedEnvelope(input) {
   const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
   if (bytes.length < 2048 || bytes.length > maximumEnvelopeBytes) {
-    throw new Error('Envelope size is invalid');
+    throw new Error("Envelope size is invalid");
   }
   const files = new Map();
   let offset = 0;
@@ -110,41 +328,41 @@ export function parseFixedEnvelope(input) {
       if (zeroBlocks === 2) break;
       continue;
     }
-    if (zeroBlocks > 0) throw new Error('Tar data follows a zero block');
-    const storedChecksum = octal(header, 148, 8, 'checksum');
+    if (zeroBlocks > 0) throw new Error("Tar data follows a zero block");
+    const storedChecksum = octal(header, 148, 8, "checksum");
     let computedChecksum = 0;
     for (let index = 0; index < 512; index += 1) {
       computedChecksum += index >= 148 && index < 156 ? 32 : header[index];
     }
-    if (storedChecksum !== computedChecksum) throw new Error('Tar checksum changed');
+    if (storedChecksum !== computedChecksum) throw new Error("Tar checksum changed");
     const name = tarString(header, 0, 100);
     const prefix = tarString(header, 345, 155);
     const linkName = tarString(header, 157, 100);
     const type = header[156];
-    const mode = octal(header, 100, 8, 'mode');
-    const size = octal(header, 124, 12, 'size');
+    const mode = octal(header, 100, 8, "mode");
+    const size = octal(header, 124, 12, "size");
     if (
       prefix ||
       linkName ||
       (type !== 0 && type !== 48) ||
       (mode & 0o111) !== 0 ||
-      !['manifest.json', 'payload.bin'].includes(name) ||
+      !["manifest.json", "payload.bin"].includes(name) ||
       files.has(name) ||
       size < 1 ||
       size > maximumEnvelopeBytes
     ) {
-      throw new Error('Tar entry is outside the fixed allowlist');
+      throw new Error("Tar entry is outside the fixed allowlist");
     }
     offset += 512;
-    if (offset + size > bytes.length) throw new Error('Tar entry is truncated');
+    if (offset + size > bytes.length) throw new Error("Tar entry is truncated");
     files.set(name, bytes.slice(offset, offset + size));
     offset += Math.ceil(size / 512) * 512;
   }
   if (zeroBlocks !== 2 || files.size !== 2) {
-    throw new Error('Tar envelope is incomplete');
+    throw new Error("Tar envelope is incomplete");
   }
   if (bytes.subarray(offset).some((byte) => byte !== 0)) {
-    throw new Error('Tar envelope has trailing data');
+    throw new Error("Tar envelope has trailing data");
   }
   return files;
 }
@@ -153,7 +371,7 @@ export function validateManifest(manifestBytes, request) {
   const text = new TextDecoder().decode(manifestBytes);
   const manifest = JSON.parse(text);
   if (`${canonicalJson(manifest)}\n` !== text) {
-    throw new Error('Transport manifest is not canonical');
+    throw new Error("Transport manifest is not canonical");
   }
   const expected = {
     controller: request.controller,
@@ -164,47 +382,47 @@ export function validateManifest(manifestBytes, request) {
       sha256: request.artifact.plaintextSha256,
     },
     requestId: request.requestId,
-    schema: 'deployment-control/private-transport-manifest/v1',
+    schema: "deployment-control/private-transport-manifest/v1",
     source: request.source,
   };
   if (canonicalJson(manifest) !== canonicalJson(expected)) {
-    throw new Error('Transport manifest differs from approved request');
+    throw new Error("Transport manifest differs from approved request");
   }
   if (sha256(manifestBytes) !== request.evidence.manifestSha256) {
-    throw new Error('Transport manifest digest changed');
+    throw new Error("Transport manifest digest changed");
   }
   return manifest;
 }
 
 async function fetchTransport(request, environment, root) {
-  const repository = join(root, 'transport.git');
+  const repository = join(root, "transport.git");
   await mkdir(repository, { mode: 0o700 });
-  const deployKey = join(root, 'deploy-key');
-  const sshWrapper = join(root, 'ssh-wrapper');
-  await writeFile(deployKey, required(environment, 'PRIVATE_TRANSPORT_DEPLOY_KEY'), {
-    flag: 'wx',
+  const deployKey = join(root, "deploy-key");
+  const sshWrapper = join(root, "ssh-wrapper");
+  await writeFile(deployKey, required(environment, "PRIVATE_TRANSPORT_DEPLOY_KEY"), {
+    flag: "wx",
     mode: 0o600,
   });
-  const knownHosts = fileURLToPath(new URL('../keys/github-known-hosts', import.meta.url));
+  const knownHosts = fileURLToPath(new URL("../keys/github-known-hosts", import.meta.url));
   const wrapper = `#!/bin/sh\nexec /usr/bin/ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o PasswordAuthentication=no -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${JSON.stringify(knownHosts)} -i ${JSON.stringify(deployKey)} "$@"\n`;
-  await writeFile(sshWrapper, wrapper, { flag: 'wx', mode: 0o700 });
+  await writeFile(sshWrapper, wrapper, { flag: "wx", mode: 0o700 });
   const gitEnvironment = {
-    GIT_CONFIG_GLOBAL: '/dev/null',
-    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
     GIT_SSH: sshWrapper,
     HOME: root,
     PATH: process.env.PATH,
   };
-  runGit(repository, ['init', '--bare'], { environment: gitEnvironment });
+  runGit(repository, ["init", "--bare"], { environment: gitEnvironment });
   runGit(
     repository,
     [
-      'fetch',
-      '--depth=1',
-      '--no-tags',
+      "fetch",
+      "--depth=1",
+      "--no-tags",
       required(
         environment,
-        'PRIVATE_TRANSPORT_GIT_URL',
+        "PRIVATE_TRANSPORT_GIT_URL",
         /^git@github\.com:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\.git$/,
       ),
       `refs/tags/${request.artifact.transportTag}:refs/tags/release`,
@@ -212,63 +430,59 @@ async function fetchTransport(request, environment, root) {
     { environment: gitEnvironment },
   );
   await chmod(deployKey, 0o600);
-  await writeFile(deployKey, '', { mode: 0o600 });
-  const commit = runGit(repository, ['rev-parse', 'refs/tags/release']).trim();
+  await writeFile(deployKey, "", { mode: 0o600 });
+  const commit = runGit(repository, ["rev-parse", "refs/tags/release"]).trim();
   if (commit !== request.artifact.transportCommitSha) {
-    throw new Error('Transport tag resolves to a different commit');
+    throw new Error("Transport tag resolves to a different commit");
   }
-  if (runGit(repository, ['cat-file', '-t', 'refs/tags/release']).trim() !== 'commit') {
-    throw new Error('Transport tag must directly reference one commit');
+  if (runGit(repository, ["cat-file", "-t", "refs/tags/release"]).trim() !== "commit") {
+    throw new Error("Transport tag must directly reference one commit");
   }
-  const ancestry = runGit(repository, ['rev-list', '--parents', '-n', '1', commit])
+  const ancestry = runGit(repository, ["rev-list", "--parents", "-n", "1", commit])
     .trim()
     .split(/\s+/);
   if (ancestry.length !== 1 || ancestry[0] !== commit) {
-    throw new Error('Transport commit must be parentless');
+    throw new Error("Transport commit must be parentless");
   }
-  const tree = parseTree(runGit(repository, ['ls-tree', '-z', commit]));
+  const tree = parseTree(runGit(repository, ["ls-tree", "-z", commit]));
   validateTransportTree(tree, request);
-  const manifestBytes = runGit(
-    repository,
-    ['cat-file', 'blob', `${commit}:manifest.json`],
-    { encoding: 'buffer' },
-  );
-  const ciphertextBytes = runGit(
-    repository,
-    ['cat-file', 'blob', `${commit}:release.gpg`],
-    { encoding: 'buffer' },
-  );
+  const manifestBytes = runGit(repository, ["cat-file", "blob", `${commit}:manifest.json`], {
+    encoding: "buffer",
+  });
+  const ciphertextBytes = runGit(repository, ["cat-file", "blob", `${commit}:release.gpg`], {
+    encoding: "buffer",
+  });
   if (
-    manifestBytes.subarray(0, 42).toString('utf8').includes('git-lfs.github.com') ||
-    ciphertextBytes.subarray(0, 42).toString('utf8').includes('git-lfs.github.com')
+    manifestBytes.subarray(0, 42).toString("utf8").includes("git-lfs.github.com") ||
+    ciphertextBytes.subarray(0, 42).toString("utf8").includes("git-lfs.github.com")
   ) {
-    throw new Error('Git LFS pointers are forbidden');
+    throw new Error("Git LFS pointers are forbidden");
   }
   if (sha256(ciphertextBytes) !== request.artifact.ciphertextSha256) {
-    throw new Error('Ciphertext digest changed');
+    throw new Error("Ciphertext digest changed");
   }
   validateManifest(manifestBytes, request);
-  const ciphertextPath = join(root, 'release.gpg');
-  await writeFile(ciphertextPath, ciphertextBytes, { flag: 'wx', mode: 0o400 });
+  const ciphertextPath = join(root, "release.gpg");
+  await writeFile(ciphertextPath, ciphertextBytes, { flag: "wx", mode: 0o400 });
   return { ciphertextPath, manifestBytes };
 }
 
 async function decrypt(ciphertextPath, environment, root) {
-  const gpgHome = join(root, 'gpg');
+  const gpgHome = join(root, "gpg");
   await mkdir(gpgHome, { mode: 0o700 });
-  const privateKey = join(root, 'decryption-key.asc');
-  const envelopePath = join(root, 'envelope.tar');
+  const privateKey = join(root, "decryption-key.asc");
+  const envelopePath = join(root, "envelope.tar");
   const passphrase = environment.RELEASE_DECRYPTION_PASSPHRASE;
   if (
-    typeof passphrase !== 'string' ||
+    typeof passphrase !== "string" ||
     passphrase.length < 16 ||
     passphrase.length > 1024 ||
     /[\r\n\0]/.test(passphrase)
   ) {
-    throw new Error('release decryption passphrase is unavailable or invalid');
+    throw new Error("release decryption passphrase is unavailable or invalid");
   }
-  await writeFile(privateKey, required(environment, 'RELEASE_DECRYPTION_PRIVATE_KEY'), {
-    flag: 'wx',
+  await writeFile(privateKey, required(environment, "RELEASE_DECRYPTION_PRIVATE_KEY"), {
+    flag: "wx",
     mode: 0o600,
   });
   const cleanEnvironment = {
@@ -277,100 +491,99 @@ async function decrypt(ciphertextPath, environment, root) {
     PATH: process.env.PATH,
   };
   const importResult = spawnSync(
-    'gpg',
-    ['--batch', '--no-tty', '--homedir', gpgHome, '--import', privateKey],
-    { encoding: 'utf8', env: cleanEnvironment, windowsHide: true },
+    "gpg",
+    ["--batch", "--no-tty", "--homedir", gpgHome, "--import", privateKey],
+    { encoding: "utf8", env: cleanEnvironment, windowsHide: true },
   );
   await chmod(privateKey, 0o600);
-  await writeFile(privateKey, '', { mode: 0o600 });
-  if (importResult.status !== 0) throw new Error('Offline GPG key import failed');
+  await writeFile(privateKey, "", { mode: 0o600 });
+  if (importResult.status !== 0) throw new Error("Offline GPG key import failed");
   const decryptResult = spawnSync(
-    'gpg',
+    "gpg",
     [
-      '--batch',
-      '--no-tty',
-      '--homedir',
+      "--batch",
+      "--no-tty",
+      "--homedir",
       gpgHome,
-      '--no-auto-key-retrieve',
-      '--auto-key-locate',
-      'clear',
-      '--pinentry-mode',
-      'loopback',
-      '--passphrase-fd',
-      '0',
-      '--output',
+      "--no-auto-key-retrieve",
+      "--auto-key-locate",
+      "clear",
+      "--pinentry-mode",
+      "loopback",
+      "--passphrase-fd",
+      "0",
+      "--output",
       envelopePath,
-      '--decrypt',
+      "--decrypt",
       ciphertextPath,
     ],
     {
-      encoding: 'utf8',
+      encoding: "utf8",
       env: cleanEnvironment,
       input: `${passphrase}\n`,
       windowsHide: true,
     },
   );
-  if (decryptResult.status !== 0) throw new Error('Offline GPG decryption failed');
+  if (decryptResult.status !== 0) throw new Error("Offline GPG decryption failed");
   return envelopePath;
 }
 
 export async function verifyProtectedTransport(environment = process.env) {
-  const encoded = required(environment, 'RELEASE_REQUEST_BASE64', /^[A-Za-z0-9_-]{100,32768}$/);
+  const encoded = required(environment, "RELEASE_REQUEST_BASE64", /^[A-Za-z0-9_-]{100,32768}$/);
   const request = JSON.parse(
-    decodeCanonicalBase64Url(encoded, 'RELEASE_REQUEST_BASE64').toString('utf8'),
+    decodeCanonicalBase64Url(encoded, "RELEASE_REQUEST_BASE64").toString("utf8"),
   );
   validateReleaseRequest(request, {
     expectedControllerRepositoryId: required(
       environment,
-      'EXPECTED_CONTROLLER_REPOSITORY_ID',
+      "EXPECTED_CONTROLLER_REPOSITORY_ID",
       decimalPattern,
     ),
-    expectedControllerSha: required(environment, 'GITHUB_SHA', shaPattern),
+    expectedControllerSha: required(environment, "GITHUB_SHA", shaPattern),
     expectedSourceRepositoryId: required(
       environment,
-      'EXPECTED_SOURCE_REPOSITORY_ID',
+      "EXPECTED_SOURCE_REPOSITORY_ID",
       decimalPattern,
     ),
   });
-  const root = await mkdtemp(join(tmpdir(), 'deployment-control-transport-'));
+  const root = await mkdtemp(join(tmpdir(), "deployment-control-transport-"));
   try {
     const encryptionPublicKey = await readFile(
-      fileURLToPath(new URL('../keys/release-encryption-public.asc', import.meta.url)),
+      fileURLToPath(new URL("../keys/release-encryption-public.asc", import.meta.url)),
     );
     if (sha256(encryptionPublicKey) !== request.artifact.encryptionKeySha256) {
-      throw new Error('Pinned encryption public key digest differs');
+      throw new Error("Pinned encryption public key digest differs");
     }
     const transport = await fetchTransport(request, environment, root);
     const envelopePath = await decrypt(transport.ciphertextPath, environment, root);
     const files = parseFixedEnvelope(await readFile(envelopePath));
-    const manifest = files.get('manifest.json');
+    const manifest = files.get("manifest.json");
     if (!manifest || !Buffer.from(manifest).equals(transport.manifestBytes)) {
-      throw new Error('Encrypted and transport manifests differ');
+      throw new Error("Encrypted and transport manifests differ");
     }
     validateManifest(manifest, request);
-    const payload = files.get('payload.bin');
-    if (!payload) throw new Error('Envelope payload is incomplete');
+    const payload = files.get("payload.bin");
+    if (!payload) throw new Error("Envelope payload is incomplete");
     if (
       payload.length !== request.artifact.plaintextBytes ||
       sha256(payload) !== request.artifact.plaintextSha256
     ) {
-      throw new Error('Plaintext capsule digest changed');
+      throw new Error("Plaintext capsule digest changed");
     }
-    const outputDirectory = resolve(
-      required(environment, 'VERIFIED_PAYLOAD_OUTPUT_DIRECTORY'),
-    );
+    validateOperationPayload(payload, request);
+    const outputDirectory = resolve(required(environment, "VERIFIED_PAYLOAD_OUTPUT_DIRECTORY"));
     await mkdir(outputDirectory, { recursive: false, mode: 0o700 });
-    const output = join(outputDirectory, 'release-capsule.bin');
-    await writeFile(output, payload, { flag: 'wx', mode: 0o400 });
+    const output = join(outputDirectory, "release-capsule.bin");
+    await writeFile(output, payload, { flag: "wx", mode: 0o400 });
     return Object.freeze({ output, request });
   } finally {
     await rm(root, { force: true, recursive: true });
   }
 }
 
-if (process.argv[1]?.endsWith('protected-transport.mjs')) {
+if (process.argv[1]?.endsWith("protected-transport.mjs")) {
   verifyProtectedTransport().then(
-    () => process.stdout.write('Protected transport verified.\n'),
+    () => process.stdout.write("Protected transport verified.\n"),
     (error) => {
       console.error(`Protected transport rejected: ${error.message}`);
       process.exitCode = 1;
